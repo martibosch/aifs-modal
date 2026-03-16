@@ -1,0 +1,147 @@
+[build-system]
+requires = ["uv_build>=0.9.4,<0.10.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+user-guide = ["meteora>=0.14.0,<0.15"]
+
+[project]
+name = "aifs-modal"
+version = "0.0.0"
+description = "Serverless AIFS setup on Modal"
+readme = "README.md"
+authors = [
+  {email = "marti.bosch@unibe.ch", name = "Martí Bosch"}
+]
+classifiers = [
+  "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+  "Natural Language :: English",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13"
+]
+
+[project.license]
+text = "GPL-3.0"
+
+[project.optional-dependencies]
+dev = [
+  "commitizen",
+  "pre-commit",
+  "toml"
+]
+doc = [
+  "myst-parser",
+  "nbsphinx",
+  "pydata-sphinx-theme",
+  "sphinx",
+  "sphinxemoji"
+]
+test = [
+  "coverage[toml]",
+  "pytest",
+  "pytest-cov",
+  "ruff"
+]
+
+[project.urls]
+Repository = "https://github.com/martibosch/aifs-modal"
+
+[tool.codespell]
+ignore-regex = '^\s*"image\/png":\s.*'
+skip = "CHANGELOG.md,pixi.lock"
+
+[tool.commitizen]
+major_version_zero = true
+name = "cz_conventional_commits"
+tag_format = "v$version"
+version_provider = "pep621"
+version_scheme = "semver"
+
+[tool.coverage.report]
+exclude_lines = [
+  "if self.debug:",
+  "pragma: no cover",
+  "raise NotImplementedError",
+  "except ModuleNotFoundError",
+  "except ImportError"
+]
+ignore_errors = true
+omit = ["tests/*", "docs/conf.py"]
+
+[tool.coverage.run]
+source = ["aifs_modal"]
+
+[tool.pixi.dependencies]
+python = ">=3.10,<3.14"
+icechunk = ">=1.1.20,<2"
+modal = ">=0.4.2.1,<0.5"
+zarr = ">=3.1.5,<4"
+earthkit-data = ">=0.19.1,<0.20"
+earthkit-regrid = ">=0.5.1,<0.6"
+modal-client = ">=1.3.4,<2"
+
+[tool.pixi.environments]
+dev = ["dev"]
+doc = ["doc"]
+test = ["test"]
+user-guide = ["user-guide"]
+
+[tool.pixi.feature.dev.tasks]
+build = {cmd = "uv build"}
+
+[tool.pixi.feature.doc.tasks]
+build-doc = {cmd = "sphinx-build docs docs/_build"}
+
+[tool.pixi.feature.test.tasks]
+test = {cmd = "pytest -s --cov=aifs_modal --cov-report=xml tests"}
+
+[tool.pixi.feature.user-guide.dependencies]
+# meteora = ">=0.14.0,<0.15.0"
+cdsapi = ">=0.7.7,<0.8"
+
+[tool.pixi.pypi-dependencies]
+aifs_modal = {path = ".", editable = true}
+
+[tool.pixi.workspace]
+authors = ["Martí Bosch <marti.bosch@unibe.ch>"]
+channels = ["conda-forge"]
+name = "aifs-modal"
+platforms = ["win-64", "linux-64", "osx-64", "osx-arm64"]
+version = "0.0.0"
+
+[tool.ruff]
+line-length = 88
+
+[tool.ruff.format]
+docstring-code-format = true
+
+[tool.ruff.lint]
+select = [
+  "D",
+  "E",
+  "F",
+  "I"
+]
+
+[tool.ruff.lint.isort]
+known-first-party = [
+  "aifs_modal"
+]
+
+[tool.ruff.lint.per-file-ignores]
+"**/__init__.py" = [
+  "F401"
+]
+"tests/test_aifs_modal.py" = [
+  "D"
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "numpy"
+
+[tool.uv.build-backend]
+module-name = "aifs_modal"
+module-root = ""
