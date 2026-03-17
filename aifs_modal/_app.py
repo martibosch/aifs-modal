@@ -338,6 +338,7 @@ def run_ensemble_forecast(
     outputs_branch: str = "main",
     checkpoint: dict | None = None,
     include_pressure_levels: bool = False,
+    overwrite: bool = False,
 ) -> None:
     """Run an ensemble forecast in parallel, one GPU per member."""
     import xarray as xr
@@ -357,22 +358,23 @@ def run_ensemble_forecast(
 
     # check if ensemble forecast already exists
     base_group = utils.datetime_to_str(date)
-    try:
-        existing = xr.open_dataset(
-            outputs_repo.readonly_session(outputs_branch).store,
-            group=base_group,
-            engine="zarr",
-            zarr_format=3,
-            chunks=None,
-        )
-        if existing.sizes.get("ensemble_member", 0) >= n_members:
-            print(
-                f"Ensemble forecast already complete for {date.isoformat()} "
-                f"({n_members} members); skipping"
+    if not overwrite:
+        try:
+            existing = xr.open_dataset(
+                outputs_repo.readonly_session(outputs_branch).store,
+                group=base_group,
+                engine="zarr",
+                zarr_format=3,
+                chunks=None,
             )
-            return
-    except Exception:
-        pass
+            if existing.sizes.get("ensemble_member", 0) >= n_members:
+                print(
+                    f"Ensemble forecast already complete for {date.isoformat()} "
+                    f"({n_members} members); skipping"
+                )
+                return
+        except Exception:
+            pass
 
     # fork the session and spawn all members in parallel
     outputs_session = outputs_repo.writable_session(outputs_branch)
@@ -451,6 +453,7 @@ def run_forecast(
     checkpoint: dict | None = None,
     n_members: int | None = None,
     include_pressure_levels: bool = False,
+    overwrite: bool = False,
 ) -> None:  # dict[str, str]:
     """Run forecast."""
     import torch
@@ -483,39 +486,45 @@ def run_forecast(
     # check if requested forecasts already exist
     # (if a target forecast already exists, do not re-run it)
     base_group = utils.datetime_to_str(date)
-    readonly_session = outputs_repo.readonly_session(outputs_branch)
 
-    if n_members is not None:
-        # ensemble: check if group already has all members
-        try:
-            existing = xr.open_dataset(
-                readonly_session.store,
-                group=base_group,
-                engine="zarr",
-                zarr_format=3,
-                chunks=None,
-            )
-            if existing.sizes.get("ensemble_member", 0) >= n_members:
+    if not overwrite:
+        readonly_session = outputs_repo.readonly_session(outputs_branch)
+
+        if n_members is not None:
+            # ensemble: check if group already has all members
+            try:
+                existing = xr.open_dataset(
+                    readonly_session.store,
+                    group=base_group,
+                    engine="zarr",
+                    zarr_format=3,
+                    chunks=None,
+                )
+                if existing.sizes.get("ensemble_member", 0) >= n_members:
+                    print(
+                        f"Ensemble forecast already complete for "
+                        f"{date.isoformat()} "
+                        f"({n_members} members); skipping"
+                    )
+                    return
+            except (zarr.errors.GroupNotFoundError, Exception):
+                pass
+        else:
+            # deterministic: check if group exists
+            try:
+                zarr.open_group(
+                    readonly_session.store,
+                    path=base_group,
+                    mode="r",
+                    zarr_format=3,
+                )
                 print(
-                    f"Ensemble forecast already complete for {date.isoformat()} "
-                    f"({n_members} members); skipping"
+                    f"Forecast already exists for {date.isoformat()} "
+                    f"(group: {base_group}); skipping"
                 )
                 return
-        except (zarr.errors.GroupNotFoundError, Exception):
-            pass
-    else:
-        # deterministic: check if group exists
-        try:
-            zarr.open_group(
-                readonly_session.store, path=base_group, mode="r", zarr_format=3
-            )
-            print(
-                f"Forecast already exists for {date.isoformat()} "
-                f"(group: {base_group}); skipping"
-            )
-            return
-        except zarr.errors.GroupNotFoundError:
-            pass
+            except zarr.errors.GroupNotFoundError:
+                pass
 
     outputs_session = outputs_repo.writable_session(outputs_branch)
 
