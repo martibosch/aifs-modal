@@ -3,7 +3,7 @@ requires = ["uv_build>=0.9.4,<0.10.0"]
 build-backend = "uv_build"
 
 [dependency-groups]
-user-guide = ["meteora>=0.14.0,<0.15"]
+user-guide = ["meteora[xvec]>=0.14.0,<0.15", "stationbench[ensemble] @ git+https://github.com/martibosch/stationbench.git", "boto3>=1.42.69,<2"]
 
 [project]
 name = "aifs-modal"
@@ -22,6 +22,7 @@ classifiers = [
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13"
 ]
+dependencies = ["earthkit-data"]
 
 [project.license]
 text = "GPL-3.0"
@@ -33,10 +34,12 @@ dev = [
   "toml"
 ]
 doc = [
+  "ipykernel",
   "myst-parser",
   "nbsphinx",
   "pydata-sphinx-theme",
   "sphinx",
+  "sphinxcontrib-mermaid",
   "sphinxemoji"
 ]
 test = [
@@ -77,17 +80,17 @@ source = ["aifs_modal"]
 [tool.pixi.dependencies]
 python = ">=3.10,<3.14"
 icechunk = ">=1.1.20,<2"
-modal = ">=0.4.2.1,<0.5"
 zarr = ">=3.1.5,<4"
-earthkit-data = ">=0.19.1,<0.20"
-earthkit-regrid = ">=0.5.1,<0.6"
 modal-client = ">=1.3.4,<2"
+ecmwf-opendata = ">=0.3.26,<0.4"
+pandas = ">=2.0.0,<3"
+earthkit-regrid = ">=0.5.1,<0.6"
 
 [tool.pixi.environments]
 dev = ["dev"]
 doc = ["doc"]
 test = ["test"]
-user-guide = ["user-guide"]
+user-guide = {features = ["doc", "user-guide"]}
 
 [tool.pixi.feature.dev.tasks]
 build = {cmd = "uv build"}
@@ -101,6 +104,9 @@ test = {cmd = "pytest -s --cov=aifs_modal --cov-report=xml tests"}
 [tool.pixi.feature.user-guide.dependencies]
 # meteora = ">=0.14.0,<0.15.0"
 cdsapi = ">=0.7.7,<0.8"
+seaborn = ">=0.13.2,<0.14"
+cartopy = ">=0.25.0,<0.26"
+ipywidgets = ">=8.1.8,<9"
 
 [tool.pixi.pypi-dependencies]
 aifs_modal = {path = ".", editable = true}

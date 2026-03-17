@@ -7,8 +7,12 @@ import queue
 import threading
 from os import path
 
+import dask.array as da
+import earthkit.regrid as ekr
 import icechunk
 import modal
+import numpy as np
+import xarray as xr
 import zarr
 
 from aifs_modal import ingest, settings, utils
@@ -95,7 +99,6 @@ def _without_aws_env():
 
 def get_gpu_regridder(source_grid, target_grid, method="linear"):
     """Create a GPU regridder using weights from Earthkit regrid."""
-    import earthkit.regrid as ekr
     import torch
 
     class GPU_Regridder:
@@ -120,9 +123,6 @@ def get_gpu_regridder(source_grid, target_grid, method="linear"):
 
 def state_to_xarray(state, regridder, include_pressure_levels=False):
     """Convert the state fields to an xarray dataset."""
-    import numpy as np
-    import xarray as xr
-
     fields = state["fields"]
     dims = ("valid_time", "lat", "lon")
     lat = 90 - 0.25 * np.arange(721)
@@ -165,7 +165,170 @@ def state_to_xarray(state, regridder, include_pressure_levels=False):
     return ds
 
 
+def _expand_to_template(member_ds, n_members):
+    """Build ensemble template from a single member's output.
+
+    Expands ``ensemble_member`` to ``range(n_members)`` and replaces data
+    arrays with dask zeros so the result can be written with
+    ``compute=False`` (metadata only).
+    """
+    data_vars = {}
+    for name, var in member_ds.data_vars.items():
+        new_shape = (n_members,) + var.shape[1:]
+        # chunk size 1 along ensemble_member and valid_time, full for others
+        chunks = (1, 1) + tuple(s for s in var.shape[2:])
+        data_vars[name] = (
+            var.dims,
+            da.zeros(new_shape, dtype=var.dtype, chunks=chunks),
+        )
+
+    coords = {
+        name: (list(range(n_members)) if name == "ensemble_member" else coord)
+        for name, coord in member_ds.coords.items()
+    }
+
+    ds = xr.Dataset(data_vars, coords=coords)
+    if hasattr(member_ds, "valid_time") and member_ds.valid_time.encoding:
+        ds.valid_time.encoding.update(member_ds.valid_time.encoding)
+    return ds
+
+
 # helpers for forecast functions
+def _open_outputs_repo(
+    storage_bucket: str,
+    *,
+    outputs_repo: str | None = None,
+    outputs_prefix: str | None = None,
+):
+    """Return an icechunk Repository for forecast outputs."""
+    if outputs_repo is not None:
+        import arraylake as al
+
+        with _without_aws_env():
+            client = al.Client(token=os.environ["ARRAYLAKE_API_TOKEN"])
+            return client.get_repo(
+                outputs_repo, config=icechunk.RepositoryConfig.default()
+            )
+    else:
+        storage = icechunk.tigris_storage(
+            bucket=storage_bucket,
+            prefix=outputs_prefix,
+            region=os.getenv("AWS_REGION", None),
+            access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
+            secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
+        )
+        return icechunk.Repository.open_or_create(storage)
+
+
+@app.function(
+    image=image,
+    volumes={settings.MODELS_DIR: models_volume},
+    secrets=_secrets,
+)
+def _initialize_ensemble_store(
+    date: datetime.datetime,
+    storage_bucket: str,
+    *,
+    n_members: int,
+    lead_time: int,
+    base_group: str,
+    outputs_repo: str | None = None,
+    outputs_prefix: str | None = None,
+    outputs_branch: str,
+    checkpoint: dict | None = None,
+    include_pressure_levels: bool = False,
+) -> None:
+    """Initialize the ensemble output arrays (metadata only) and commit.
+
+    Loads checkpoint metadata on CPU to derive variable names, builds a dask-zeros
+    template with the correct shape, writes it with ``compute=False``, and commits.
+    All ensemble members can then open cooperative writable sessions from this snapshot.
+    """
+    from anemoi.inference.runners.simple import SimpleRunner
+
+    if checkpoint is None:
+        checkpoint = settings.AIFS_ENS_CHECKPOINT
+
+    # load checkpoint on CPU to get output variable names, no GPU needed
+    runner = SimpleRunner(checkpoint, device="cpu")
+    ckpt = runner.checkpoint
+    # output_tensor_index_to_variable includes both prognostic and diagnostic vars
+    expected_vars = set(ckpt.output_tensor_index_to_variable.values())
+    del runner
+
+    # separate surface from pressure-level variables
+    pressure_levels = [50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000]
+    pressure_var_prefixes = {"q", "t", "u", "v", "w", "z"}
+    pressure_suffixed = {
+        f"{v}_{p}" for v in pressure_var_prefixes for p in pressure_levels
+    }
+    surface_vars = sorted(expected_vars - pressure_suffixed)
+
+    # build template dataset
+    n_steps = lead_time // 6
+    lat = 90 - 0.25 * np.arange(721)
+    lon = 0.25 * np.arange(1440)
+    valid_times = np.array(
+        [
+            date.replace(tzinfo=None) + datetime.timedelta(hours=6 * (i + 1))
+            for i in range(n_steps)
+        ],
+        dtype="datetime64[ns]",
+    )
+
+    surface_shape = (n_members, n_steps, 721, 1440)
+    surface_chunks = (1, 1, 721, 1440)
+    data_vars = {
+        var: (
+            ("ensemble_member", "valid_time", "lat", "lon"),
+            da.zeros(surface_shape, dtype="f4", chunks=surface_chunks),
+        )
+        for var in surface_vars
+    }
+    if include_pressure_levels:
+        pressure_shape = (n_members, n_steps, 13, 721, 1440)
+        pressure_chunks = (1, 1, 13, 721, 1440)
+        for var in pressure_var_prefixes:
+            data_vars[var] = (
+                ("ensemble_member", "valid_time", "pressure", "lat", "lon"),
+                da.zeros(pressure_shape, dtype="f4", chunks=pressure_chunks),
+            )
+
+    coords = {
+        "ensemble_member": list(range(n_members)),
+        "valid_time": (
+            "valid_time",
+            valid_times,
+            {"axis": "T", "standard_name": "time"},
+        ),
+        "lat": ("lat", lat, {"standard_name": "latitude", "axis": "Y"}),
+        "lon": ("lon", lon, {"standard_name": "longitude", "axis": "X"}),
+        "pressure": pressure_levels,
+    }
+    template = xr.Dataset(data_vars, coords=coords)
+    template.valid_time.encoding.update(
+        {"units": "hours since 1970-01-01T00:00:00", "chunks": (1200,)}
+    )
+
+    # write metadata-only template and commit
+    outputs_repo_obj = _open_outputs_repo(
+        storage_bucket, outputs_repo=outputs_repo, outputs_prefix=outputs_prefix
+    )
+    session = outputs_repo_obj.writable_session(outputs_branch)
+    template.to_zarr(
+        session.store,
+        group=base_group,
+        zarr_format=3,
+        consolidated=False,
+        mode="w",
+        compute=False,
+    )
+    session.commit(
+        f"initialize ensemble template for {base_group} ({n_members} members)"
+    )
+    print(f"initialized ensemble template for {base_group}")
+
+
 def _load_initial_conditions(
     storage_bucket: str,
     *,
@@ -205,13 +368,12 @@ def _run_member(
     lead_time: int = 96,
     include_pressure_levels: bool = False,
 ):
-    """Load ICs, run a single forecast member, return an xarray Dataset.
+    """Load icechunk session, run a single forecast member and return an xarray Dataset.
 
-    If *member_id* is not None the ensemble checkpoint is used and the torch
-    seed is set to *member_id* for reproducibility.
+    If *member_id* is not None the ensemble checkpoint is used and the torch seed is set
+    to *member_id* for reproducibility.
     """
     import torch
-    import xarray as xr
     from anemoi.inference.outputs.printer import print_state
     from anemoi.inference.runners.simple import SimpleRunner
 
@@ -277,25 +439,32 @@ def _run_member(
 )
 def run_ensemble_member(
     member_id: int,
-    fork_session: icechunk.ForkSession,
     date: datetime.datetime,
     storage_bucket: str,
     *,
     lead_time: int = 96,
     base_group: str,
+    fork_session,
     initial_conditions_repo: str | None = None,
     initial_conditions_prefix: str | None = None,
     initial_conditions_branch: str = "main",
     checkpoint: dict | None = None,
     include_pressure_levels: bool = False,
-) -> icechunk.ForkSession:
-    """Run a single ensemble member and write results to a fork session."""
+):
+    """Run a single ensemble member and return its fork session.
+
+    Writes into the pre-initialized output arrays using ``region="auto"`` via a
+    ``ForkSession`` and returns it. The orchestrator merges all fork sessions and
+    issues a single commit (cooperative distributed writes).
+    """
+    # 1. load initial conditions
     ic_session = _load_initial_conditions(
         storage_bucket,
         initial_conditions_repo=initial_conditions_repo,
         initial_conditions_prefix=initial_conditions_prefix,
         initial_conditions_branch=initial_conditions_branch,
     )
+    # 2. inference
     member_ds = _run_member(
         date,
         ic_session,
@@ -303,19 +472,17 @@ def run_ensemble_member(
         member_id=member_id,
         lead_time=lead_time,
         include_pressure_levels=include_pressure_levels,
-    ).chunk()
+    )
 
-    # write to a member-specific sub-group within the fork session
-    member_group = f"{base_group}/__member_{member_id}"
+    # 3. write slice to fork session (no commit)
     member_ds.to_zarr(
         fork_session.store,
-        group=member_group,
+        group=base_group,
         zarr_format=3,
         consolidated=False,
-        mode="w",
+        region="auto",
     )
-    print(f"member {member_id}: written to {member_group}")
-
+    print(f"member {member_id}: wrote slice to {base_group}")
     del member_ds
     return fork_session
 
@@ -334,34 +501,34 @@ def run_ensemble_forecast(
     initial_conditions_repo: str | None = None,
     initial_conditions_prefix: str | None = None,
     initial_conditions_branch: str = "main",
-    outputs_prefix: str = "aifs-outputs",
+    outputs_repo: str | None = None,
+    outputs_prefix: str | None = None,
     outputs_branch: str = "main",
     checkpoint: dict | None = None,
     include_pressure_levels: bool = False,
     overwrite: bool = False,
 ) -> None:
-    """Run an ensemble forecast in parallel, one GPU per member."""
-    import xarray as xr
+    """Run an ensemble forecast in parallel, one GPU per member.
 
+    Uses icechunk cooperative distributed writes: a dedicated CPU function initializes
+    the output arrays from checkpoint metadata (no inference needed), then all members
+    run concurrently, write their slice with ``region="auto"``, and return their change
+    set. The orchestrator merges all change sets and issues a single commit.
+    """
     # set up outputs repo and branch
-    outputs_storage = icechunk.tigris_storage(
-        bucket=storage_bucket,
-        prefix=outputs_prefix,
-        region=os.getenv("AWS_REGION", None),
-        access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
-        secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
+    outputs_repo_obj = _open_outputs_repo(
+        storage_bucket, outputs_repo=outputs_repo, outputs_prefix=outputs_prefix
     )
-    outputs_repo = icechunk.Repository.open_or_create(outputs_storage)
-    if outputs_branch not in outputs_repo.list_branches():
-        base = outputs_repo.readonly_session("main").snapshot_id
-        outputs_repo.create_branch(outputs_branch, base)
+    if outputs_branch not in outputs_repo_obj.list_branches():
+        base = outputs_repo_obj.readonly_session("main").snapshot_id
+        outputs_repo_obj.create_branch(outputs_branch, base)
 
     # check if ensemble forecast already exists
     base_group = utils.datetime_to_str(date)
     if not overwrite:
         try:
             existing = xr.open_dataset(
-                outputs_repo.readonly_session(outputs_branch).store,
+                outputs_repo_obj.readonly_session(outputs_branch).store,
                 group=base_group,
                 engine="zarr",
                 zarr_format=3,
@@ -376,13 +543,32 @@ def run_ensemble_forecast(
         except Exception:
             pass
 
-    # fork the session and spawn all members in parallel
-    outputs_session = outputs_repo.writable_session(outputs_branch)
-    fork = outputs_session.fork()
+    # initialize output arrays from checkpoint metadata (CPU, no inference)
+    _initialize_ensemble_store.remote(
+        date,
+        storage_bucket,
+        n_members=n_members,
+        lead_time=lead_time,
+        base_group=base_group,
+        outputs_repo=outputs_repo,
+        outputs_prefix=outputs_prefix,
+        outputs_branch=outputs_branch,
+        checkpoint=checkpoint,
+        include_pressure_levels=include_pressure_levels,
+    )
 
+    # create fork session for cooperative distributed writes
+    outputs_repo_obj = _open_outputs_repo(
+        storage_bucket, outputs_repo=outputs_repo, outputs_prefix=outputs_prefix
+    )
+    session = outputs_repo_obj.writable_session(outputs_branch)
+    fork = session.fork()
+
+    # spawn all members in parallel — each writes its slice to the fork and returns it
     member_kwargs = dict(
         lead_time=lead_time,
         base_group=base_group,
+        fork_session=fork,
         initial_conditions_repo=initial_conditions_repo,
         initial_conditions_prefix=initial_conditions_prefix,
         initial_conditions_branch=initial_conditions_branch,
@@ -391,45 +577,15 @@ def run_ensemble_forecast(
     )
     print(f"spawning {n_members} ensemble members in parallel")
     handles = [
-        run_ensemble_member.spawn(m, fork, date, storage_bucket, **member_kwargs)
+        run_ensemble_member.spawn(m, date, storage_bucket, **member_kwargs)
         for m in range(n_members)
     ]
+    fork_sessions = [h.get() for h in handles]
 
-    # collect returned fork sessions
-    returned_forks = [h.get() for h in handles]
-    print(f"all {n_members} members completed, merging sessions")
-
-    # merge all fork sessions into the main session
-    outputs_session.merge(*returned_forks)
-
-    # combine temporary sub-groups into a single dataset with ensemble_member dim
-    member_datasets = []
-    for m in range(n_members):
-        member_group = f"{base_group}/__member_{m}"
-        ds = xr.open_dataset(
-            outputs_session.store,
-            group=member_group,
-            engine="zarr",
-            zarr_format=3,
-        )
-        member_datasets.append(ds)
-
-    combined = xr.concat(member_datasets, dim="ensemble_member").chunk()
-    combined.to_zarr(
-        outputs_session.store,
-        group=base_group,
-        zarr_format=3,
-        consolidated=False,
-        mode="w",
-    )
-    print(f"combined {n_members} members into {base_group}")
-
-    commit_msg = (
-        f"{lead_time} hour forecast ({n_members} members) for "
-        f"{date.strftime('%Y-%m-%d %H:%M')}"
-    )
-    outputs_session.commit(commit_msg)
-    print(commit_msg)
+    # merge all fork sessions and commit once
+    session.merge(*fork_sessions)
+    session.commit(f"ensemble forecast for {base_group} ({n_members} members)")
+    print(f"all {n_members} members merged and committed")
 
 
 @app.function(
@@ -448,7 +604,8 @@ def run_forecast(
     initial_conditions_repo: str | None = None,
     initial_conditions_prefix: str | None = None,
     initial_conditions_branch: str = "main",
-    outputs_prefix: str = "aifs-outputs",
+    outputs_repo: str | None = None,
+    outputs_prefix: str | None = None,
     outputs_branch: str = "main",
     checkpoint: dict | None = None,
     n_members: int | None = None,
@@ -457,7 +614,6 @@ def run_forecast(
 ) -> None:  # dict[str, str]:
     """Run forecast."""
     import torch
-    import xarray as xr
     from anemoi.inference.outputs.printer import print_state
     from anemoi.inference.runners.simple import SimpleRunner
 
@@ -470,25 +626,20 @@ def run_forecast(
         initial_conditions_branch=initial_conditions_branch,
     )
 
-    # get outputs session
-    outputs_storage = icechunk.tigris_storage(
-        bucket=storage_bucket,
-        prefix=outputs_prefix,
-        region=os.getenv("AWS_REGION", None),
-        access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
-        secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
+    # get outputs repo
+    outputs_repo_obj = _open_outputs_repo(
+        storage_bucket, outputs_repo=outputs_repo, outputs_prefix=outputs_prefix
     )
-    outputs_repo = icechunk.Repository.open_or_create(outputs_storage)
-    if outputs_branch not in outputs_repo.list_branches():
-        base = outputs_repo.readonly_session("main").snapshot_id
-        outputs_repo.create_branch(outputs_branch, base)
+    if outputs_branch not in outputs_repo_obj.list_branches():
+        base = outputs_repo_obj.readonly_session("main").snapshot_id
+        outputs_repo_obj.create_branch(outputs_branch, base)
 
     # check if requested forecasts already exist
     # (if a target forecast already exists, do not re-run it)
     base_group = utils.datetime_to_str(date)
 
     if not overwrite:
-        readonly_session = outputs_repo.readonly_session(outputs_branch)
+        readonly_session = outputs_repo_obj.readonly_session(outputs_branch)
 
         if n_members is not None:
             # ensemble: check if group already has all members
@@ -526,7 +677,7 @@ def run_forecast(
             except zarr.errors.GroupNotFoundError:
                 pass
 
-    outputs_session = outputs_repo.writable_session(outputs_branch)
+    outputs_session = outputs_repo_obj.writable_session(outputs_branch)
 
     # run forecasts
     if n_members is not None:
@@ -623,7 +774,7 @@ def run_forecast(
     member_str = f" ({n_members} members)" if n_members else ""
     commit_msg = (
         f"{lead_time} hour forecast{member_str} for "
-        f"{date.strftime('%Y-%m-%d %H:%M')} written to {outputs_repo}"
+        f"{date.strftime('%Y-%m-%d %H:%M')} written to {outputs_repo_obj}"
     )
     outputs_session.commit(commit_msg)
     print(commit_msg)

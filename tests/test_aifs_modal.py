@@ -1,3 +1,8 @@
 """Tests for AIFS on Modal."""
 
-# Write your tests here
+import unittest
+
+
+class TestImports(unittest.TestCase):
+    def test_imports(self):
+        import aifs_modal  # noqa: F401
