@@ -199,6 +199,7 @@ def _open_outputs_repo(
     *,
     outputs_repo: str | None = None,
     outputs_prefix: str | None = None,
+    storage_type: str = "tigris",
 ):
     """Return an icechunk Repository for forecast outputs."""
     if outputs_repo is not None:
@@ -210,14 +211,9 @@ def _open_outputs_repo(
                 outputs_repo, config=icechunk.RepositoryConfig.default()
             )
     else:
-        storage = icechunk.tigris_storage(
-            bucket=storage_bucket,
-            prefix=outputs_prefix,
-            region=os.getenv("AWS_REGION", None),
-            access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
-            secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
+        return icechunk.Repository.open_or_create(
+            utils.get_storage(storage_bucket, outputs_prefix, storage_type)
         )
-        return icechunk.Repository.open_or_create(storage)
 
 
 @app.function(
@@ -237,6 +233,7 @@ def _initialize_ensemble_store(
     outputs_branch: str,
     checkpoint: dict | None = None,
     include_pressure_levels: bool = False,
+    storage_type: str = "tigris",
 ) -> None:
     """Initialize the ensemble output arrays (metadata only) and commit.
 
@@ -312,7 +309,10 @@ def _initialize_ensemble_store(
 
     # write metadata-only template and commit
     outputs_repo_obj = _open_outputs_repo(
-        storage_bucket, outputs_repo=outputs_repo, outputs_prefix=outputs_prefix
+        storage_bucket,
+        outputs_repo=outputs_repo,
+        outputs_prefix=outputs_prefix,
+        storage_type=storage_type,
     )
     session = outputs_repo_obj.writable_session(outputs_branch)
     template.to_zarr(
@@ -335,6 +335,7 @@ def _load_initial_conditions(
     initial_conditions_repo: str | None = None,
     initial_conditions_prefix: str | None = None,
     initial_conditions_branch: str = "main",
+    storage_type: str = "tigris",
 ):
     """Return a readonly icechunk session for initial conditions."""
     if initial_conditions_repo is not None:
@@ -347,16 +348,9 @@ def _load_initial_conditions(
                 initial_conditions_repo, config=config
             ).readonly_session(initial_conditions_branch)
     else:
-        ic_storage = icechunk.tigris_storage(
-            bucket=storage_bucket,
-            prefix=initial_conditions_prefix,
-            region=os.getenv("AWS_REGION", None),
-            access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
-            secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
-        )
-        return icechunk.Repository.open(ic_storage).readonly_session(
-            initial_conditions_branch
-        )
+        return icechunk.Repository.open(
+            utils.get_storage(storage_bucket, initial_conditions_prefix, storage_type)
+        ).readonly_session(initial_conditions_branch)
 
 
 def _run_member(
@@ -450,6 +444,7 @@ def run_ensemble_member(
     initial_conditions_branch: str = "main",
     checkpoint: dict | None = None,
     include_pressure_levels: bool = False,
+    storage_type: str = "tigris",
 ):
     """Run a single AIFS-ENS ensemble member.
 
@@ -495,6 +490,9 @@ def run_ensemble_member(
     include_pressure_levels : bool, optional
         If ``True``, pressure-level variables (``q``, ``t``, ``u``, ``v``,
         ``w``, ``z`` on 13 levels) are included in the output. Default ``False``.
+    storage_type : {"tigris", "s3", "r2", "gcs", "azure"}, optional
+        Object-storage backend for the initial conditions repository (ignored
+        when ``initial_conditions_repo`` is set). Default ``"tigris"``.
 
     Returns
     -------
@@ -508,6 +506,7 @@ def run_ensemble_member(
         initial_conditions_repo=initial_conditions_repo,
         initial_conditions_prefix=initial_conditions_prefix,
         initial_conditions_branch=initial_conditions_branch,
+        storage_type=storage_type,
     )
     # 2. inference
     member_ds = _run_member(
@@ -552,6 +551,7 @@ def run_ensemble_forecast(
     checkpoint: dict | None = None,
     include_pressure_levels: bool = False,
     overwrite: bool = False,
+    storage_type: str = "tigris",
 ) -> None:
     """Run an AIFS-ENS ensemble forecast in parallel, one GPU per member.
 
@@ -609,10 +609,17 @@ def run_ensemble_forecast(
     overwrite : bool, optional
         If ``True``, re-run the forecast even if the output group already exists.
         Default ``False``.
+    storage_type : {"tigris", "s3", "r2", "gcs", "azure"}, optional
+        Object-storage backend for both the initial conditions and outputs
+        repositories (ignored when the corresponding ``*_repo`` parameter is
+        set). Default ``"tigris"``.
     """
     # set up outputs repo and branch
     outputs_repo_obj = _open_outputs_repo(
-        storage_bucket, outputs_repo=outputs_repo, outputs_prefix=outputs_prefix
+        storage_bucket,
+        outputs_repo=outputs_repo,
+        outputs_prefix=outputs_prefix,
+        storage_type=storage_type,
     )
     if outputs_branch not in outputs_repo_obj.list_branches():
         base = outputs_repo_obj.readonly_session("main").snapshot_id
@@ -650,11 +657,15 @@ def run_ensemble_forecast(
         outputs_branch=outputs_branch,
         checkpoint=checkpoint,
         include_pressure_levels=include_pressure_levels,
+        storage_type=storage_type,
     )
 
     # create fork session for cooperative distributed writes
     outputs_repo_obj = _open_outputs_repo(
-        storage_bucket, outputs_repo=outputs_repo, outputs_prefix=outputs_prefix
+        storage_bucket,
+        outputs_repo=outputs_repo,
+        outputs_prefix=outputs_prefix,
+        storage_type=storage_type,
     )
     session = outputs_repo_obj.writable_session(outputs_branch)
     fork = session.fork()
@@ -669,6 +680,7 @@ def run_ensemble_forecast(
         initial_conditions_branch=initial_conditions_branch,
         checkpoint=checkpoint,
         include_pressure_levels=include_pressure_levels,
+        storage_type=storage_type,
     )
     print(f"spawning {n_members} ensemble members in parallel")
     handles = [
@@ -706,6 +718,7 @@ def run_forecast(
     n_members: int | None = None,
     include_pressure_levels: bool = False,
     overwrite: bool = False,
+    storage_type: str = "tigris",
 ) -> None:  # dict[str, str]:
     """Run a deterministic or sequential ensemble AIFS forecast on a single GPU.
 
@@ -764,6 +777,10 @@ def run_forecast(
     overwrite : bool, optional
         If ``True``, re-run the forecast even if the output group already exists.
         Default ``False``.
+    storage_type : {"tigris", "s3", "r2", "gcs", "azure"}, optional
+        Object-storage backend for both the initial conditions and outputs
+        repositories (ignored when the corresponding ``*_repo`` parameter is
+        set). Default ``"tigris"``.
     """
     import torch
     from anemoi.inference.outputs.printer import print_state
@@ -776,11 +793,15 @@ def run_forecast(
         initial_conditions_repo=initial_conditions_repo,
         initial_conditions_prefix=initial_conditions_prefix,
         initial_conditions_branch=initial_conditions_branch,
+        storage_type=storage_type,
     )
 
     # get outputs repo
     outputs_repo_obj = _open_outputs_repo(
-        storage_bucket, outputs_repo=outputs_repo, outputs_prefix=outputs_prefix
+        storage_bucket,
+        outputs_repo=outputs_repo,
+        outputs_prefix=outputs_prefix,
+        storage_type=storage_type,
     )
     if outputs_branch not in outputs_repo_obj.list_branches():
         base = outputs_repo_obj.readonly_session("main").snapshot_id

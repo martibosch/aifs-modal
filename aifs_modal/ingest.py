@@ -1,7 +1,6 @@
 """Ingestion utils."""
 
 import datetime
-import os
 
 import earthkit.data as ekd
 import earthkit.regrid as ekr
@@ -11,6 +10,7 @@ import zarr
 from earthkit.data import config
 
 from aifs_modal import utils
+from aifs_modal.utils import _STORAGE_TYPES
 
 config.set("cache-policy", "off")
 
@@ -267,21 +267,43 @@ def ingest(
     *,
     initial_conditions_prefix: str = "aifs-initial-conditions",
     initial_conditions_branch: str = "main",
+    storage_type: str = "tigris",
 ) -> None:
-    """Ingest initial conditions locally into Tigris-backed Icechunk storage."""
+    """Ingest initial conditions locally into an Icechunk-backed object store.
+
+    Parameters
+    ----------
+    start_date : str
+        ISO-8601 datetime string for the first analysis time to ingest. Must be
+        a whole hour at 00, 06, 12, or 18 UTC (e.g. ``"2025-06-20T00:00:00"``).
+    end_date : str
+        ISO-8601 datetime string for the last analysis time to ingest (inclusive).
+    storage_bucket : str
+        Bucket (or container) name in the target object store.
+    initial_conditions_prefix : str, optional
+        Key prefix within ``storage_bucket`` for the initial conditions icechunk
+        repository. Default ``"aifs-initial-conditions"``.
+    initial_conditions_branch : str, optional
+        Branch name in the initial conditions repository. Default ``"main"``.
+    storage_type : {"tigris", "s3", "r2", "gcs", "azure"}, optional
+        Object-storage backend. Credentials are read from standard environment
+        variables for each backend (e.g. ``AWS_ACCESS_KEY_ID`` /
+        ``AWS_SECRET_ACCESS_KEY`` for S3-compatible backends,
+        ``AZURE_STORAGE_ACCOUNT`` / ``AZURE_STORAGE_ACCESS_KEY`` for Azure).
+        Default ``"tigris"``.
+    """
     start = _parse_utc_date(start_date)
     end = _parse_utc_date(end_date)
     if end < start:
         msg = f"end_date must be >= start_date (got {start_date!r} -> {end_date!r})"
         raise ValueError(msg)
+    if storage_type not in _STORAGE_TYPES:
+        raise ValueError(
+            f"Unknown storage_type: {storage_type!r}. "
+            f"Must be one of: {', '.join(_STORAGE_TYPES)}"
+        )
 
-    storage = icechunk.tigris_storage(
-        bucket=storage_bucket,
-        prefix=initial_conditions_prefix,
-        region=os.getenv("AWS_REGION", None),
-        access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
-        secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
-    )
+    storage = utils.get_storage(storage_bucket, initial_conditions_prefix, storage_type)
     repo = icechunk.Repository.open_or_create(storage)
     session = repo.writable_session(initial_conditions_branch)
 

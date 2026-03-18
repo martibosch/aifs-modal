@@ -3744,7 +3744,7 @@ packages:
 - pypi: ./
   name: aifs-modal
   version: 0.0.0
-  sha256: 0aa7d2955764ecd60e132ae309f75ffb6fb37592e03bea53da3c0b639d5867aa
+  sha256: d3c592d2b65f2722d06b5f2684bcde2f34099387f0505045b44c3efa0bce480a
   requires_dist:
   - earthkit-data
   - commitizen ; extra == 'dev'
