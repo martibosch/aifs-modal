@@ -4150,8 +4150,8 @@ packages:
   requires_python: '>=3.9'
 - pypi: ./
   name: aifs-modal
-  version: 0.0.0
-  sha256: 3e8fc5ef7217e90f7ff15e57bbc577baafb190c2b710d40778985040ae93dc23
+  version: 0.1.0
+  sha256: ac0afa9af4d7020e7b302e8be9644a8c4ff357270dbf11aa262cbfe282549d03
   requires_dist:
   - earthkit-data
   - commitizen ; extra == 'dev'

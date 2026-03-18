@@ -7,7 +7,7 @@ user-guide = ["meteora[xvec]>=0.14.0,<0.15", "stationbench[ensemble] @ git+https
 
 [project]
 name = "aifs-modal"
-version = "0.0.0"
+version = "0.1.0"
 description = "Serverless AIFS setup on Modal"
 readme = "README.md"
 authors = [
