@@ -54,6 +54,8 @@ Repository = "https://github.com/martibosch/aifs-modal"
 
 [tool.codespell]
 ignore-regex = '^\s*"image\/png":\s.*'
+# for xarray coordinate names in text-like cell outputs
+ignore-words-list = "ges"
 skip = "CHANGELOG.md,pixi.lock"
 
 [tool.commitizen]
@@ -76,6 +78,9 @@ omit = ["tests/*", "docs/conf.py"]
 
 [tool.coverage.run]
 source = ["aifs_modal"]
+
+[tool.mdformat]
+number = true
 
 [tool.pixi.dependencies]
 python = ">=3.10,<3.14"

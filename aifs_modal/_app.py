@@ -451,11 +451,56 @@ def run_ensemble_member(
     checkpoint: dict | None = None,
     include_pressure_levels: bool = False,
 ):
-    """Run a single ensemble member and return its fork session.
+    """Run a single AIFS-ENS ensemble member.
 
     Writes into the pre-initialized output arrays using ``region="auto"`` via a
     ``ForkSession`` and returns it. The orchestrator merges all fork sessions and
     issues a single commit (cooperative distributed writes).
+
+    Parameters
+    ----------
+    member_id : int
+        Zero-based ensemble member index. Used as the PyTorch random seed for
+        stochastic perturbations, ensuring reproducibility across runs.
+    date : datetime.datetime
+        Forecast initialisation time (analysis time ``t``). AIFS requires two
+        consecutive 6-hourly analyses (``t-6h`` and ``t``) as initial conditions.
+    storage_bucket : str
+        S3/Tigris bucket name used for both the initial conditions and output
+        icechunk repositories when not using ArrayLake.
+    lead_time : int, optional
+        Total forecast lead time in hours. Must be a multiple of 6. Default 96.
+    base_group : str
+        Zarr group path within the outputs repository where the forecast is stored,
+        typically ``"YYYY-MM-DD/HHz"``.
+    fork_session : icechunk.ForkSession
+        Forked icechunk session (from ``session.fork()``) used for cooperative
+        distributed writes. Each member writes its slice and returns the fork;
+        the orchestrator merges all forks and commits once.
+    initial_conditions_repo : str or None, optional
+        Earthmover/ArrayLake repository name (``"org/repo"``) for initial
+        conditions. When set, ICs are pulled directly from ArrayLake and
+        ``ARRAYLAKE_API_TOKEN`` must be available in the environment.
+        Mutually exclusive with ``initial_conditions_prefix``.
+    initial_conditions_prefix : str or None, optional
+        Object-storage prefix within ``storage_bucket`` for the self-managed
+        initial conditions icechunk repository. Used when not reading from
+        ArrayLake.
+    initial_conditions_branch : str, optional
+        Branch name in the initial conditions repository. Default ``"main"``.
+    checkpoint : dict or None, optional
+        Anemoi-inference checkpoint descriptor, e.g.
+        ``{"huggingface": "ecmwf/aifs-ens-1.0"}``. Defaults to the AIFS-ENS
+        checkpoint defined in ``settings``.
+    include_pressure_levels : bool, optional
+        If ``True``, pressure-level variables (``q``, ``t``, ``u``, ``v``,
+        ``w``, ``z`` on 13 levels) are included in the output. Default ``False``.
+
+    Returns
+    -------
+    icechunk.ForkSession
+        The fork session after writing the member's output slice, to be merged
+        by the orchestrator.
     """
     # 1. load initial conditions
     ic_session = _load_initial_conditions(
@@ -508,12 +553,62 @@ def run_ensemble_forecast(
     include_pressure_levels: bool = False,
     overwrite: bool = False,
 ) -> None:
-    """Run an ensemble forecast in parallel, one GPU per member.
+    """Run an AIFS-ENS ensemble forecast in parallel, one GPU per member.
 
-    Uses icechunk cooperative distributed writes: a dedicated CPU function initializes
-    the output arrays from checkpoint metadata (no inference needed), then all members
-    run concurrently, write their slice with ``region="auto"``, and return their change
-    set. The orchestrator merges all change sets and issues a single commit.
+    Uses icechunk cooperative distributed writes: a dedicated CPU function
+    initializes the output arrays from checkpoint metadata (no inference needed),
+    then all members run concurrently, write their slice with ``region="auto"``,
+    and return their fork session. The orchestrator merges all forks and issues a
+    single commit.
+
+    The function is idempotent: if the output group already contains at least
+    ``n_members`` ensemble members it exits early without spawning any containers,
+    unless ``overwrite=True``.
+
+    Parameters
+    ----------
+    date : datetime.datetime
+        Forecast initialisation time (analysis time ``t``). AIFS requires two
+        consecutive 6-hourly analyses (``t-6h`` and ``t``) as initial conditions.
+    storage_bucket : str
+        S3/Tigris bucket name used for both the initial conditions and output
+        icechunk repositories when not using ArrayLake.
+    n_members : int
+        Number of ensemble members to run. Each member gets its own GPU container
+        and uses its zero-based index as the PyTorch random seed.
+    lead_time : int, optional
+        Total forecast lead time in hours. Must be a multiple of 6. Default 96.
+    initial_conditions_repo : str or None, optional
+        Earthmover/ArrayLake repository name (``"org/repo"``) for initial
+        conditions. When set, ICs are pulled directly from ArrayLake and
+        ``ARRAYLAKE_API_TOKEN`` must be available in the environment.
+        Mutually exclusive with ``initial_conditions_prefix``.
+    initial_conditions_prefix : str or None, optional
+        Object-storage prefix within ``storage_bucket`` for the self-managed
+        initial conditions icechunk repository.
+    initial_conditions_branch : str, optional
+        Branch name in the initial conditions repository. Default ``"main"``.
+    outputs_repo : str or None, optional
+        Earthmover/ArrayLake repository name (``"org/repo"``) for forecast
+        outputs. When set, outputs are written to ArrayLake and
+        ``ARRAYLAKE_API_TOKEN`` must be available in the environment.
+        Mutually exclusive with ``outputs_prefix``.
+    outputs_prefix : str or None, optional
+        Object-storage prefix within ``storage_bucket`` for the self-managed
+        outputs icechunk repository.
+    outputs_branch : str, optional
+        Branch name in the outputs repository. Created from ``"main"`` if it
+        does not yet exist. Default ``"main"``.
+    checkpoint : dict or None, optional
+        Anemoi-inference checkpoint descriptor, e.g.
+        ``{"huggingface": "ecmwf/aifs-ens-1.0"}``. Defaults to the AIFS-ENS
+        checkpoint defined in ``settings``.
+    include_pressure_levels : bool, optional
+        If ``True``, pressure-level variables (``q``, ``t``, ``u``, ``v``,
+        ``w``, ``z`` on 13 levels) are included in the output. Default ``False``.
+    overwrite : bool, optional
+        If ``True``, re-run the forecast even if the output group already exists.
+        Default ``False``.
     """
     # set up outputs repo and branch
     outputs_repo_obj = _open_outputs_repo(
@@ -612,7 +707,64 @@ def run_forecast(
     include_pressure_levels: bool = False,
     overwrite: bool = False,
 ) -> None:  # dict[str, str]:
-    """Run forecast."""
+    """Run a deterministic or sequential ensemble AIFS forecast on a single GPU.
+
+    When ``n_members`` is ``None`` the AIFS-Single checkpoint is used for a
+    single deterministic run, streaming each 6-hourly step to the output store
+    via a background writer thread. When ``n_members`` is set the AIFS-ENS
+    checkpoint is used and members are run sequentially on the same GPU, each
+    appended along the ``ensemble_member`` dimension.
+
+    The function is idempotent: deterministic runs are skipped if the output
+    group already exists; ensemble runs are skipped when the group already
+    contains at least ``n_members`` members — unless ``overwrite=True``.
+
+    Parameters
+    ----------
+    date : datetime.datetime
+        Forecast initialisation time (analysis time ``t``). AIFS requires two
+        consecutive 6-hourly analyses (``t-6h`` and ``t``) as initial conditions.
+    storage_bucket : str
+        S3/Tigris bucket name used for both the initial conditions and output
+        icechunk repositories when not using ArrayLake.
+    lead_time : int, optional
+        Total forecast lead time in hours. Must be a multiple of 6. Default 96.
+    initial_conditions_repo : str or None, optional
+        Earthmover/ArrayLake repository name (``"org/repo"``) for initial
+        conditions. When set, ICs are pulled directly from ArrayLake and
+        ``ARRAYLAKE_API_TOKEN`` must be available in the environment.
+        Mutually exclusive with ``initial_conditions_prefix``.
+    initial_conditions_prefix : str or None, optional
+        Object-storage prefix within ``storage_bucket`` for the self-managed
+        initial conditions icechunk repository.
+    initial_conditions_branch : str, optional
+        Branch name in the initial conditions repository. Default ``"main"``.
+    outputs_repo : str or None, optional
+        Earthmover/ArrayLake repository name (``"org/repo"``) for forecast
+        outputs. When set, outputs are written to ArrayLake and
+        ``ARRAYLAKE_API_TOKEN`` must be available in the environment.
+        Mutually exclusive with ``outputs_prefix``.
+    outputs_prefix : str or None, optional
+        Object-storage prefix within ``storage_bucket`` for the self-managed
+        outputs icechunk repository.
+    outputs_branch : str, optional
+        Branch name in the outputs repository. Created from ``"main"`` if it
+        does not yet exist. Default ``"main"``.
+    checkpoint : dict or None, optional
+        Anemoi-inference checkpoint descriptor, e.g.
+        ``{"huggingface": "ecmwf/aifs-single-1.1"}``. Defaults to the
+        AIFS-Single checkpoint (deterministic) or AIFS-ENS (when ``n_members``
+        is set), as defined in ``settings``.
+    n_members : int or None, optional
+        Number of ensemble members to run sequentially on a single GPU. If
+        ``None`` (default), a single deterministic forecast is produced.
+    include_pressure_levels : bool, optional
+        If ``True``, pressure-level variables (``q``, ``t``, ``u``, ``v``,
+        ``w``, ``z`` on 13 levels) are included in the output. Default ``False``.
+    overwrite : bool, optional
+        If ``True``, re-run the forecast even if the output group already exists.
+        Default ``False``.
+    """
     import torch
     from anemoi.inference.outputs.printer import print_state
     from anemoi.inference.runners.simple import SimpleRunner

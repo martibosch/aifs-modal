@@ -21,6 +21,7 @@ repos:
       - id: mdformat
         additional_dependencies:
           - mdformat-gfm
+          - mdformat-pyproject
           - mdformat-ruff
 
   - repo: https://github.com/pappasam/toml-sort

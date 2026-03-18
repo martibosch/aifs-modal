@@ -4,7 +4,7 @@ hidden:
 maxdepth: 1
 ---
 
-usage
+how-it-works
 user-guide/index
 api
 contributing

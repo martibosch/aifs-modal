@@ -16,6 +16,7 @@ extensions = [
     "sphinx.ext.napoleon",
     "myst_parser",
     "nbsphinx",
+    "sphinxcontrib.mermaid",
 ]
 
 exclude_patterns = ["_build", "**/.ipynb_checkpoints", "**/.ipynb_checkpoints/*"]
