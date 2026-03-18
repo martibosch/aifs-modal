@@ -90,6 +90,7 @@ modal-client = ">=1.3.4,<2"
 ecmwf-opendata = ">=0.3.26,<0.4"
 pandas = ">=2.0.0,<3"
 earthkit-regrid = ">=0.5.1,<0.6"
+netcdf4 = ">=1.7.0"
 
 [tool.pixi.environments]
 dev = ["dev"]
