@@ -98,6 +98,9 @@ doc = ["doc"]
 test = ["test"]
 user-guide = {features = ["doc", "user-guide"]}
 
+[tool.pixi.feature.dev.dependencies]
+uv = ">=0.6"
+
 [tool.pixi.feature.dev.tasks]
 build = {cmd = "uv build"}
 
