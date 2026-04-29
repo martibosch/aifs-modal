@@ -2,23 +2,31 @@
 
 import datetime
 import unittest
+from unittest import mock
 
 import icechunk
 import numpy as np
 import zarr
 
 from aifs_modal import utils
-from aifs_modal.ingest import (
+from aifs_modal.ic import (
     LEVELS,
+    _iter_dates_6h,
+    _parse_utc_date,
+    fetch_initial_conditions,
+    ingest_range,
+)
+from aifs_modal.ic import (
+    _stack_fields as stack_fields,
+)
+from aifs_modal.ic import (
+    _store_data as store_data,
+)
+from aifs_modal.ingest_ekd import (
     PARAM_PL,
     PARAM_SFC,
     PARAM_SOIL,
     SOIL_LEVELS,
-    _iter_dates_6h,
-    _parse_utc_date,
-    fetch_initial_conditions,
-    stack_fields,
-    store_data,
 )
 
 
@@ -177,3 +185,28 @@ class TestFetchInitialConditions(unittest.TestCase):
         for v in result.values():
             # each field has shape (2, npoints) — stacked [t-6h, t]
             self.assertEqual(v.shape, (2, self.NPOINTS))
+
+
+class TestIngestRange(unittest.TestCase):
+    def test_skips_existing_dates(self):
+        storage = icechunk.in_memory_storage()
+        calls = []
+
+        def fetch_fn(date):
+            calls.append(date)
+            return {"a": np.arange(4, dtype="f4")}
+
+        kwargs = dict(
+            start_date="2025-01-01T00:00:00+00:00",
+            end_date="2025-01-01T00:00:00+00:00",
+            storage_bucket="unused",
+            fetch_fn=fetch_fn,
+            source="ifs-ekd",
+            initial_conditions_prefix="unused",
+        )
+
+        with mock.patch("aifs_modal.ic.utils.get_storage", return_value=storage):
+            ingest_range(**kwargs)
+            ingest_range(**kwargs)
+
+        self.assertEqual(len(calls), 1)

@@ -4,6 +4,22 @@
 AIFS_SINGLE_CHECKPOINT = {"huggingface": "ecmwf/aifs-single-1.1"}
 AIFS_ENS_CHECKPOINT = {"huggingface": "ecmwf/aifs-ens-1.0"}
 
+# initial-conditions sources
+IC_SOURCES = ("ifs-ekd", "era5-cds", "era5-arco", "ifs-arraylake")
+DEFAULT_IC_SOURCE = "ifs-ekd"
+
+# default storage prefix per source. Per-source so that two sources don't share
+# a repo (different IC content for the same date would silently mix).
+DEFAULT_IC_PREFIXES = {
+    "ifs-ekd": "aifs-ics-ifs",
+    "era5-cds": "aifs-ics-era5-cds",
+    "era5-arco": "aifs-ics-era5-arco",
+    "ifs-arraylake": "aifs-ics-ifs-arraylake",
+}
+
+# default forecast args
+LEAD_TIME = 96
+
 # modal app config
 GPU_TYPE = "L40S"
 DATA_VOLUME_NAME = "aifs-data"

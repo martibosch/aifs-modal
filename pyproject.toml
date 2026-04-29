@@ -23,8 +23,9 @@ classifiers = [
   "Programming Language :: Python :: 3.13"
 ]
 dependencies = [
-  "earthkit-data",
-  "icechunk>=1.1.20,<2",
+  "earthkit-data[cds]",
+  "gcsfs>=2022.11.0",
+  # "icechunk>=1.1.20,<2",
   "zarr>=3.1.5,<4",
   "modal>=1.3.4,<2",
   "ecmwf-opendata>=0.3.26,<0.4",
@@ -96,6 +97,7 @@ number = true
 python = ">=3.10,<3.14"
 hdf5 = ">=2.1.0,<3"
 libnetcdf = ">=4.10.0,<5"
+icechunk = ">=2.0.3,<3"
 
 [tool.pixi.environments]
 dev = ["dev"]
@@ -117,10 +119,17 @@ test = {cmd = "pytest -s --cov=aifs_modal --cov-report=xml tests"}
 
 [tool.pixi.feature.user-guide.dependencies]
 # meteora = ">=0.14.0,<0.15.0"
+boto3 = ">=1.42.93,<2"
 cdsapi = ">=0.7.7,<0.8"
 seaborn = ">=0.13.2,<0.14"
-cartopy = ">=0.25.0,<0.26"
 ipywidgets = ">=8.1.8,<9"
+matplotlib = ">=3.10.8,<4"
+cartopy = ">=0.25.0,<0.26"
+proj = ">=9.5"
+pandas = ">=2.0.0,<3"
+# eumdac = ">=3.1.1,<4"
+# satpy = ">=0.60.0,<0.61"
+arraylake = ">=1.0.1,<2"
 
 [tool.pixi.pypi-dependencies]
 aifs_modal = {path = ".", editable = true}

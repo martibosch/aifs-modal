@@ -1,13 +1,24 @@
-"""AIFS Modal app."""
+"""AIFS on Modal — single app for ingestion (ARCO/us-central1) and inference (GPU).
+
+Two images on the same app:
+
+``ingest_image``
+    Lightweight CPU image used by ARCO-ERA5 ingestion functions, which run in
+    ``us-central1`` for in-region GCS bandwidth.
+``infer_image``
+    CUDA + torch + flash-attn image used by inference functions and the
+    CPU-side orchestrators that share its dependencies.
+
+Open-data and CDS-based ingestion don't need a dedicated image: ``run_forecast``
+already does that work CPU-side inside ``infer_image``, gated by
+``_ensure_ic_for_forecast``.
+"""
 
 import contextlib
 import datetime
 import os
-import queue
-import threading
 from os import path
 
-import dask.array as da
 import earthkit.regrid as ekr
 import icechunk
 import modal
@@ -15,46 +26,57 @@ import numpy as np
 import xarray as xr
 import zarr
 
-from aifs_modal import ingest, settings, utils
+from aifs_modal import ic, ingest_ekd, settings, utils
 
 # volumes
 data_volume = modal.Volume.from_name(settings.DATA_VOLUME_NAME, create_if_missing=True)
-# volume to store models, i.e., (i) HuggingFace Hub cache, (ii) PyTorch hub cache and
-# (iii) our checkpoints (eventually)
 models_volume = modal.Volume.from_name(
     settings.MODELS_VOLUME_NAME, create_if_missing=True
 )
 
 # secrets
-# arraylake is optional: only included when ARRAYLAKE_API_TOKEN is set locally,
-# i.e., when the user wants to pull initial conditions from an Arraylake repo
 _secrets = [modal.Secret.from_name("aws-credentials")]
 if os.getenv("ARRAYLAKE_API_TOKEN"):
     _secrets.append(modal.Secret.from_name("arraylake-api-token"))
-# hf token is also optional (enable faster downloads)
 if os.getenv("HF_HUB_TOKEN"):
     _secrets.append(modal.Secret.from_name("huggingface-secret"))
 
 app = modal.App(settings.APP_NAME)
 
+# ---------------------------------------------------------------------------
+# Images
+# ---------------------------------------------------------------------------
+
+ingest_image = modal.Image.debian_slim(python_version="3.12").uv_pip_install(
+    "arraylake",
+    "boto3",
+    "dask",
+    "earthkit-data",
+    "earthkit-regrid",
+    "gcsfs",
+    "icechunk",
+    "numpy",
+    "xarray",
+    "zarr",
+)
+
 flash_attn_release = (
     "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/"
     "flash_attn-2.8.3+cu12torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
 )
-image = (
+infer_image = (
     modal.Image.from_registry(
         "nvidia/cuda:12.6.0-runtime-ubuntu22.04", add_python="3.12"
     )
     .apt_install("git")
     .uv_pip_install(
-        # "anemoi-datasets==0.5.21",
-        # "anemoi-graphs==0.5.0",
         "anemoi-inference[huggingface]==0.6.3",
         "anemoi-models==0.5.1",
         "anemoi-utils==0.4.22",
         "arraylake",
         "boto3",
         "earthkit-regrid",
+        "ecmwf-opendata",
         flash_attn_release,
         "icechunk",
         "numpy",
@@ -68,7 +90,6 @@ image = (
         {
             "HF_HUB_CACHE": path.join(settings.MODELS_DIR, "hf_hub_cache"),
             "TORCH_HOME": path.join(settings.MODELS_DIR, "torch"),
-            # "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
             "PYTORCH_ALLOC_CONF": "expandable_segments:True",
             "ANEMOI_INFERENCE_NUM_CHUNKS": "16",
         }
@@ -76,7 +97,21 @@ image = (
 )
 
 
-# utils
+# ---------------------------------------------------------------------------
+# Output grid constants (0.25° lat/lon, AIFS pressure levels)
+# ---------------------------------------------------------------------------
+
+LAT = 90 - 0.25 * np.arange(721)
+LON = 0.25 * np.arange(1440)
+PRESSURE_LEVELS = [50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000]
+PRESSURE_VAR_PREFIXES = ("q", "t", "u", "v", "w", "z")
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
 @contextlib.contextmanager
 def _without_aws_env():
     keys = [
@@ -121,79 +156,136 @@ def get_gpu_regridder(source_grid, target_grid, method="linear"):
     return GPU_Regridder(source_grid, target_grid, method)
 
 
-def state_to_xarray(state, regridder, include_pressure_levels=False):
-    """Convert the state fields to an xarray dataset."""
+def state_to_xarray(state, regridder, init_time, include_pressure_levels=False):
+    """Convert state fields to an xarray dataset with init_time + lead_time schema."""
     fields = state["fields"]
-    dims = ("valid_time", "lat", "lon")
-    lat = 90 - 0.25 * np.arange(721)
-    lon = 0.25 * np.arange(1440)
-    pressure = [50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000]
+    valid_time = state["date"].replace(tzinfo=None)
+    lead_time = valid_time - init_time
+
     ds = xr.Dataset(
         {
             vname: (
-                dims,
-                regridder.regrid(array)[None, :, :],
+                ("init_time", "lead_time", "lat", "lon"),
+                regridder.regrid(array)[None, None, :, :],
             )
             for vname, array in fields.items()
         },
         coords={
-            "valid_time": (
-                "valid_time",
-                [state["date"]],
-                {"axis": "T", "standard_name": "time"},
+            "init_time": (
+                "init_time",
+                [init_time],
+                {"standard_name": "forecast_reference_time"},
             ),
-            "lat": ("lat", lat, {"standard_name": "latitude", "axis": "Y"}),
-            "lon": ("lon", lon, {"standard_name": "longitude", "axis": "X"}),
-            "pressure": pressure,
+            "lead_time": (
+                "lead_time",
+                [lead_time],
+                {"standard_name": "forecast_period"},
+            ),
+            "lat": ("lat", LAT, {"standard_name": "latitude", "axis": "Y"}),
+            "lon": ("lon", LON, {"standard_name": "longitude", "axis": "X"}),
+            "pressure": PRESSURE_LEVELS,
         },
-    )
-    ds.valid_time.encoding.update(
-        {"units": "hours since 1970-01-01T00:00:00", "chunks": (1200,)}
     )
 
     to_drop = []
-    for pvar in ["q", "t", "u", "v", "w", "z"]:
-        vnames = [f"{pvar}_{plev}" for plev in pressure]
+    for pvar in PRESSURE_VAR_PREFIXES:
+        vnames = [f"{pvar}_{plev}" for plev in PRESSURE_LEVELS]
         if include_pressure_levels:
             ds[pvar] = xr.concat(
-                [ds[vname] for vname in vnames], dim="pressure"
-            ).transpose("valid_time", ...)
+                [
+                    ds[vname].assign_coords(pressure=plev)
+                    for vname, plev in zip(vnames, PRESSURE_LEVELS)
+                ],
+                dim="pressure",
+            ).transpose("init_time", "lead_time", ...)
         to_drop.extend(vnames)
 
-    ds = ds.drop_vars(to_drop)
-
-    return ds
+    return ds.drop_vars(to_drop)
 
 
-def _expand_to_template(member_ds, n_members):
-    """Build ensemble template from a single member's output.
+def _make_fetch_fn(
+    source: str,
+    *,
+    source_repo: str | None = None,
+    source_branch: str = "main",
+):
+    """Resolve a source label into a ``fetch_fn(date) -> dict`` callable."""
+    if source == "ifs-ekd":
+        return ingest_ekd.get_all_data
+    if source == "era5-cds":
+        return lambda d: ingest_ekd.get_all_data(d, cds=True)
+    if source == "era5-arco":
+        from aifs_modal import ingest_arco
 
-    Expands ``ensemble_member`` to ``range(n_members)`` and replaces data
-    arrays with dask zeros so the result can be written with
-    ``compute=False`` (metadata only).
-    """
-    data_vars = {}
-    for name, var in member_ds.data_vars.items():
-        new_shape = (n_members,) + var.shape[1:]
-        # chunk size 1 along ensemble_member and valid_time, full for others
-        chunks = (1, 1) + tuple(s for s in var.shape[2:])
-        data_vars[name] = (
-            var.dims,
-            da.zeros(new_shape, dtype=var.dtype, chunks=chunks),
+        # ACHTUNG: import here because of optional `gcsfs` dep
+        return ingest_arco.get_all_data
+    if source == "ifs-arraylake":
+        import arraylake as al
+
+        from aifs_modal import ingest_arraylake
+
+        # ACHTUNG: import here because of optional `arraylake` dep
+        if source_repo is None:
+            raise ValueError("source_repo is required when source='ifs-arraylake'")
+        with _without_aws_env():
+            al_client = al.Client(token=os.environ["ARRAYLAKE_API_TOKEN"])
+        al_session = al_client.get_repo(source_repo).readonly_session(source_branch)
+        source_ds = xr.open_dataset(
+            al_session.store, engine="zarr", zarr_format=3, chunks={}
+        )
+        return lambda d: ingest_arraylake.get_all_data(source_ds, d)
+    raise ValueError(
+        f"Unknown source: {source!r}. Must be one of: {', '.join(settings.IC_SOURCES)}"
+    )
+
+
+def _resolve_ic(
+    source: str | None, initial_conditions_prefix: str | None
+) -> tuple[str, str]:
+    """Resolve ``(source, prefix)`` defaults from :mod:`aifs_modal.settings`."""
+    if source is None:
+        source = settings.DEFAULT_IC_SOURCE
+    if initial_conditions_prefix is None:
+        initial_conditions_prefix = settings.DEFAULT_IC_PREFIXES[source]
+    return source, initial_conditions_prefix
+
+
+def _require_outputs_target(
+    outputs_repo: str | None, outputs_prefix: str | None
+) -> None:
+    """Forecast outputs are bespoke artifacts: the user must name where they go."""
+    if outputs_repo is None and outputs_prefix is None:
+        raise ValueError(
+            "outputs_prefix (or outputs_repo for arraylake) is required: "
+            "forecast outputs are not given a default name to avoid silently "
+            "overwriting other runs."
         )
 
-    coords = {
-        name: (list(range(n_members)) if name == "ensemble_member" else coord)
-        for name, coord in member_ds.coords.items()
-    }
 
-    ds = xr.Dataset(data_vars, coords=coords)
-    if hasattr(member_ds, "valid_time") and member_ds.valid_time.encoding:
-        ds.valid_time.encoding.update(member_ds.valid_time.encoding)
-    return ds
+def _ensure_ic_for_forecast(
+    date: datetime.datetime,
+    storage_bucket: str,
+    *,
+    source: str,
+    initial_conditions_prefix: str,
+    initial_conditions_branch: str,
+    storage_type: str,
+    source_repo: str | None = None,
+    source_branch: str = "main",
+) -> None:
+    """Ensure IC for *date* and *date−6h* are committed, ingesting if absent."""
+    fetch_fn = _make_fetch_fn(
+        source, source_repo=source_repo, source_branch=source_branch
+    )
+    ic_repo = icechunk.Repository.open_or_create(
+        utils.get_storage(storage_bucket, initial_conditions_prefix, storage_type)
+    )
+    for ic_date in [date - datetime.timedelta(hours=6), date]:
+        ic.ensure_date_ingested(
+            ic_date, ic_repo, fetch_fn, initial_conditions_branch, source=source
+        )
 
 
-# helpers for forecast functions
 def _open_outputs_repo(
     storage_bucket: str,
     *,
@@ -210,123 +302,9 @@ def _open_outputs_repo(
             return client.get_repo(
                 outputs_repo, config=icechunk.RepositoryConfig.default()
             )
-    else:
-        return icechunk.Repository.open_or_create(
-            utils.get_storage(storage_bucket, outputs_prefix, storage_type)
-        )
-
-
-@app.function(
-    image=image,
-    volumes={settings.MODELS_DIR: models_volume},
-    secrets=_secrets,
-)
-def _initialize_ensemble_store(
-    date: datetime.datetime,
-    storage_bucket: str,
-    *,
-    n_members: int,
-    lead_time: int,
-    base_group: str,
-    outputs_repo: str | None = None,
-    outputs_prefix: str | None = None,
-    outputs_branch: str,
-    checkpoint: dict | None = None,
-    include_pressure_levels: bool = False,
-    storage_type: str = "tigris",
-) -> None:
-    """Initialize the ensemble output arrays (metadata only) and commit.
-
-    Loads checkpoint metadata on CPU to derive variable names, builds a dask-zeros
-    template with the correct shape, writes it with ``compute=False``, and commits.
-    All ensemble members can then open cooperative writable sessions from this snapshot.
-    """
-    from anemoi.inference.runners.simple import SimpleRunner
-
-    if checkpoint is None:
-        checkpoint = settings.AIFS_ENS_CHECKPOINT
-
-    # load checkpoint on CPU to get output variable names, no GPU needed
-    runner = SimpleRunner(checkpoint, device="cpu")
-    ckpt = runner.checkpoint
-    # output_tensor_index_to_variable includes both prognostic and diagnostic vars
-    expected_vars = set(ckpt.output_tensor_index_to_variable.values())
-    del runner
-
-    # separate surface from pressure-level variables
-    pressure_levels = [50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000]
-    pressure_var_prefixes = {"q", "t", "u", "v", "w", "z"}
-    pressure_suffixed = {
-        f"{v}_{p}" for v in pressure_var_prefixes for p in pressure_levels
-    }
-    surface_vars = sorted(expected_vars - pressure_suffixed)
-
-    # build template dataset
-    n_steps = lead_time // 6
-    lat = 90 - 0.25 * np.arange(721)
-    lon = 0.25 * np.arange(1440)
-    valid_times = np.array(
-        [
-            date.replace(tzinfo=None) + datetime.timedelta(hours=6 * (i + 1))
-            for i in range(n_steps)
-        ],
-        dtype="datetime64[ns]",
+    return icechunk.Repository.open_or_create(
+        utils.get_storage(storage_bucket, outputs_prefix, storage_type)
     )
-
-    surface_shape = (n_members, n_steps, 721, 1440)
-    surface_chunks = (1, 1, 721, 1440)
-    data_vars = {
-        var: (
-            ("ensemble_member", "valid_time", "lat", "lon"),
-            da.zeros(surface_shape, dtype="f4", chunks=surface_chunks),
-        )
-        for var in surface_vars
-    }
-    if include_pressure_levels:
-        pressure_shape = (n_members, n_steps, 13, 721, 1440)
-        pressure_chunks = (1, 1, 13, 721, 1440)
-        for var in pressure_var_prefixes:
-            data_vars[var] = (
-                ("ensemble_member", "valid_time", "pressure", "lat", "lon"),
-                da.zeros(pressure_shape, dtype="f4", chunks=pressure_chunks),
-            )
-
-    coords = {
-        "ensemble_member": list(range(n_members)),
-        "valid_time": (
-            "valid_time",
-            valid_times,
-            {"axis": "T", "standard_name": "time"},
-        ),
-        "lat": ("lat", lat, {"standard_name": "latitude", "axis": "Y"}),
-        "lon": ("lon", lon, {"standard_name": "longitude", "axis": "X"}),
-        "pressure": pressure_levels,
-    }
-    template = xr.Dataset(data_vars, coords=coords)
-    template.valid_time.encoding.update(
-        {"units": "hours since 1970-01-01T00:00:00", "chunks": (1200,)}
-    )
-
-    # write metadata-only template and commit
-    outputs_repo_obj = _open_outputs_repo(
-        storage_bucket,
-        outputs_repo=outputs_repo,
-        outputs_prefix=outputs_prefix,
-        storage_type=storage_type,
-    )
-    session = outputs_repo_obj.writable_session(outputs_branch)
-    template.to_zarr(
-        session.store,
-        group=base_group,
-        zarr_format=3,
-        consolidated=False,
-        mode="w",
-        compute=False,
-    )
-    session.commit(
-        f"initialize ensemble template for {base_group} ({n_members} members)"
-    )
-    print(f"initialized ensemble template for {base_group}")
 
 
 def _load_initial_conditions(
@@ -347,58 +325,34 @@ def _load_initial_conditions(
             return client.get_repo(
                 initial_conditions_repo, config=config
             ).readonly_session(initial_conditions_branch)
-    else:
-        return icechunk.Repository.open(
-            utils.get_storage(storage_bucket, initial_conditions_prefix, storage_type)
-        ).readonly_session(initial_conditions_branch)
+    return icechunk.Repository.open(
+        utils.get_storage(storage_bucket, initial_conditions_prefix, storage_type)
+    ).readonly_session(initial_conditions_branch)
 
 
 def _run_member(
     date: datetime.datetime,
-    ic_session,
-    checkpoint: dict | None,
+    runner,
+    fields: dict,
+    regridder,
     *,
     member_id: int | None = None,
     lead_time: int = 96,
     include_pressure_levels: bool = False,
 ):
-    """Load icechunk session, run a single forecast member and return an xarray Dataset.
-
-    If *member_id* is not None the ensemble checkpoint is used and the torch seed is set
-    to *member_id* for reproducibility.
-    """
+    """Run one forecast member with a pre-built runner/regridder/fields."""
     import torch
     from anemoi.inference.outputs.printer import print_state
-    from anemoi.inference.runners.simple import SimpleRunner
 
     date_no_tz = date.replace(tzinfo=None)
     label = f"member {member_id}" if member_id is not None else "forecast"
 
-    print(f"{label}: loading initial conditions for {date}")
-    fields = ingest.fetch_initial_conditions(date, ic_session)
-    input_state = dict(date=date_no_tz, fields=fields)
-
-    if checkpoint is None:
-        checkpoint = (
-            settings.AIFS_ENS_CHECKPOINT
-            if member_id is not None
-            else settings.AIFS_SINGLE_CHECKPOINT
-        )
-
-    runner = SimpleRunner(checkpoint, device="cuda")
-
-    # filter input fields
     expected_vars = set(runner.checkpoint.variable_to_input_tensor_index)
     extra = set(fields) - expected_vars
     if extra:
-        print(f"{label}: dropping {len(extra)} extra variables: {extra}")
+        print(f"{label}: dropping {len(extra)} extra variables: {sorted(extra)}")
         fields = {k: v for k, v in fields.items() if k in expected_vars}
-        input_state = dict(date=date_no_tz, fields=fields)
-    missing = expected_vars - set(fields)
-    if missing:
-        print(f"{label}: {len(missing)} variables computed by runner")
-
-    regridder = get_gpu_regridder({"grid": "N320"}, {"grid": (0.25, 0.25)})
+    input_state = dict(date=date_no_tz, fields=fields)
 
     if member_id is not None:
         torch.manual_seed(member_id)
@@ -411,11 +365,12 @@ def _run_member(
             state_to_xarray(
                 state,
                 regridder=regridder,
+                init_time=date_no_tz,
                 include_pressure_levels=include_pressure_levels,
             )
         )
 
-    ds = xr.concat(steps, dim="valid_time")
+    ds = xr.concat(steps, dim="lead_time")
     if member_id is not None:
         ds = ds.expand_dims(ensemble_member=[member_id])
 
@@ -423,84 +378,374 @@ def _run_member(
     return ds
 
 
-# app
+# ---------------------------------------------------------------------------
+# ARCO-ERA5 ingestion (us-central1, CPU)
+# ---------------------------------------------------------------------------
+
+_PARALLEL_THRESHOLD = 4
+
+
 @app.function(
-    image=image,
+    image=ingest_image,
+    region="us-central1",
+    timeout=60 * 30,
+    cpu=4,
+    secrets=_secrets,
+)
+def _ingest_arco_date(
+    date: datetime.datetime,
+    fork_session: "icechunk.ForkSession",
+) -> "icechunk.ForkSession":
+    """Fetch one date from ARCO-ERA5 and write its zarr group into the fork."""
+    from aifs_modal import ingest_arco
+
+    print(f"ingesting ARCO-ERA5 {date.isoformat()}")
+    ic.get_and_store_date(date, fork_session, ingest_arco.get_all_data)
+    return fork_session
+
+
+@app.function(
+    image=ingest_image,
+    region="us-central1",
+    timeout=60 * 60 * 4,
+    secrets=_secrets,
+)
+def _ingest_arco_sequential(
+    start: datetime.datetime,
+    end: datetime.datetime,
+    storage_bucket: str,
+    *,
+    initial_conditions_prefix: str,
+    initial_conditions_branch: str,
+    storage_type: str,
+) -> None:
+    """Sequential ARCO-ERA5 ingestion in a single container.
+
+    Used for small ranges (<= ``_PARALLEL_THRESHOLD`` dates) where fork
+    overhead would outweigh the parallelism benefit.
+    """
+    from aifs_modal import ingest_arco
+    from aifs_modal.ic import _iter_dates_6h
+
+    storage = utils.get_storage(storage_bucket, initial_conditions_prefix, storage_type)
+    repo = icechunk.Repository.open_or_create(storage)
+    session = repo.writable_session(initial_conditions_branch)
+
+    dates = list(_iter_dates_6h(start, end))
+    for i, date in enumerate(dates, start=1):
+        print(f"[{i}/{len(dates)}] ingesting ARCO-ERA5 {date.isoformat()}")
+        ic.get_and_store_date(date, session, ingest_arco.get_all_data)
+
+    commit_msg = (
+        f"Wrote ARCO-ERA5 initial conditions from {start.isoformat()} "
+        f"to {end.isoformat()} ({len(dates)} dates)"
+    )
+    session.commit(commit_msg)
+    print(commit_msg)
+
+
+@app.function(
+    image=ingest_image,
+    region="us-central1",
+    timeout=60 * 60 * 4,
+    secrets=_secrets,
+)
+def ingest_arco_era5(
+    start_date: str,
+    end_date: str,
+    storage_bucket: str,
+    *,
+    initial_conditions_prefix: str | None = None,
+    initial_conditions_branch: str = "main",
+    storage_type: str = "tigris",
+) -> None:
+    """ARCO-ERA5 ingestion, co-located with the ``us-central1`` bucket.
+
+    For small ranges (<= ``_PARALLEL_THRESHOLD`` dates) a single container runs
+    sequentially.  For larger ranges one container per date is spawned and the
+    orchestrator merges all forks into a single commit.
+    """
+    from aifs_modal.ic import _iter_dates_6h, _parse_utc_date
+
+    if initial_conditions_prefix is None:
+        initial_conditions_prefix = settings.DEFAULT_IC_PREFIXES["era5-arco"]
+
+    start = _parse_utc_date(start_date)
+    end = _parse_utc_date(end_date)
+    if end < start:
+        raise ValueError(
+            f"end_date must be >= start_date (got {start_date!r} -> {end_date!r})"
+        )
+
+    storage = utils.get_storage(storage_bucket, initial_conditions_prefix, storage_type)
+    repo = icechunk.Repository.open_or_create(storage)
+
+    if initial_conditions_branch not in repo.list_branches():
+        base = repo.readonly_session("main").snapshot_id
+        repo.create_branch(initial_conditions_branch, base)
+
+    dates = list(_iter_dates_6h(start, end))
+
+    if len(dates) <= _PARALLEL_THRESHOLD:
+        _ingest_arco_sequential.remote(
+            start,
+            end,
+            storage_bucket,
+            initial_conditions_prefix=initial_conditions_prefix,
+            initial_conditions_branch=initial_conditions_branch,
+            storage_type=storage_type,
+        )
+    else:
+        session = repo.writable_session(initial_conditions_branch)
+        fork = session.fork()
+
+        print(f"spawning {len(dates)} date workers in us-central1")
+        handles = [_ingest_arco_date.spawn(d, fork) for d in dates]
+        fork_sessions = [h.get() for h in handles]
+
+        session.merge(*fork_sessions)
+        commit_msg = (
+            f"Wrote ARCO-ERA5 initial conditions from {start.isoformat()} "
+            f"to {end.isoformat()} ({len(dates)} dates)"
+        )
+        session.commit(commit_msg)
+        print(commit_msg)
+
+
+# ---------------------------------------------------------------------------
+# Inference (GPU + CPU orchestrators on infer_image)
+# ---------------------------------------------------------------------------
+
+
+def _drop_regionless_coords(ds: xr.Dataset, region_dim: str) -> xr.Dataset:
+    """Drop coords that don't span ``region_dim``.
+
+    Ensures that region-write does not try to overwrite them (the template already has
+    them).
+    """
+    coord_names = [
+        name for name, coord in ds.coords.items() if region_dim not in coord.dims
+    ]
+    return ds.drop_vars(coord_names)
+
+
+def _as_str_list(val) -> list[str] | None:
+    """Coerce ``val`` into a list of variable-name strings, or None.
+
+    Accepts dicts (returns whichever side is all-strings), or iterables of
+    strings.  Returns None if the value isn't shaped like a list of names.
+    """
+    if val is None:
+        return None
+    if isinstance(val, dict):
+        keys = list(val.keys())
+        if keys and all(isinstance(k, str) for k in keys):
+            return keys
+        vals = list(val.values())
+        if vals and all(isinstance(v, str) for v in vals):
+            return vals
+        return None
+    try:
+        seq = list(val)
+    except TypeError:
+        return None
+    if seq and all(isinstance(x, str) for x in seq):
+        return seq
+    return None
+
+
+def _checkpoint_output_variables(ck) -> list[str]:
+    """Read the output variable list from an anemoi Checkpoint.
+
+    Anemoi has shifted the public API for this across versions, so we try a
+    few known shapes in order:
+      1. ``variable_to_output_tensor_index`` / ``output_tensor_index_to_variable``
+         (direct mapping of output-tensor positions to names);
+      2. ``prognostic_variables + diagnostic_variables`` (prognostics are
+         advanced by the model, diagnostics are side-outputs like precip /
+         radiation / clouds);
+      3. fall back to ``variable_to_input_tensor_index`` (covers prognostics
+         only — will miss diagnostics if the model has any).
+    """
+    for attr in ("variable_to_output_tensor_index", "output_tensor_index_to_variable"):
+        names = _as_str_list(getattr(ck, attr, None))
+        if names:
+            return names
+
+    prog = _as_str_list(getattr(ck, "prognostic_variables", None)) or []
+    diag = _as_str_list(getattr(ck, "diagnostic_variables", None)) or []
+    if prog or diag:
+        seen: set[str] = set()
+        out: list[str] = []
+        for v in (*prog, *diag):
+            if v not in seen:
+                seen.add(v)
+                out.append(v)
+        return out
+
+    return _as_str_list(getattr(ck, "variable_to_input_tensor_index", None)) or []
+
+
+def _introspect_output_schema(
+    checkpoint: dict | None,
+    include_pressure_levels: bool,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Load the checkpoint on CPU once to read its output variable list.
+
+    Returns ``(surface_vars, pressure_vars)``: surface vars are the 4D
+    ``(init, lead, lat, lon)`` outputs; pressure vars are the prefixes
+    (``q``, ``t``, ...) that ``state_to_xarray`` stacks into 5D when
+    ``include_pressure_levels`` is true.
+    """
+    from anemoi.inference.runners.simple import SimpleRunner
+
+    if checkpoint is None:
+        checkpoint = settings.AIFS_ENS_CHECKPOINT
+    runner = SimpleRunner(checkpoint, device="cpu")
+    ck = runner.checkpoint
+    out_vars = _checkpoint_output_variables(ck)
+    in_vars = _as_str_list(getattr(ck, "variable_to_input_tensor_index", None)) or []
+    if not out_vars or not all(isinstance(v, str) for v in out_vars):
+        raise RuntimeError(
+            "could not extract output variable names from anemoi Checkpoint. "
+            f"got {type(out_vars).__name__} of length {len(out_vars)}: "
+            f"first 5 = {out_vars[:5]!r}. "
+            f"available attrs: {sorted(a for a in dir(ck) if not a.startswith('_'))}"
+        )
+    if set(out_vars) <= set(in_vars):
+        # input-only schema means we missed the model's diagnostics; better
+        # to fail here than build a template that crashes every member.
+        raise RuntimeError(
+            "output variable schema only contains inputs (no diagnostics). "
+            f"in_vars={in_vars[:5]}..., out_vars={out_vars[:5]}.... "
+            f"available attrs: {sorted(a for a in dir(ck) if not a.startswith('_'))}"
+        )
+    print(f"discovered {len(out_vars)} output variables (input vars: {len(in_vars)})")
+
+    pressure_vars: list[str] = []
+    surface_vars: list[str] = []
+    pressure_seen: set[str] = set()
+    for v in out_vars:
+        prefix, _, level = v.partition("_")
+        if level and level.isdigit() and prefix in PRESSURE_VAR_PREFIXES:
+            if prefix not in pressure_seen:
+                pressure_vars.append(prefix)
+                pressure_seen.add(prefix)
+        else:
+            surface_vars.append(v)
+
+    if include_pressure_levels:
+        return tuple(surface_vars), tuple(pressure_vars)
+    # pressure vars get dropped by state_to_xarray when include_pressure_levels=False
+    return tuple(surface_vars), ()
+
+
+def _empty_ensemble_template(
+    date: datetime.datetime,
+    *,
+    n_members: int,
+    lead_time: int,
+    surface_vars: tuple[str, ...],
+    pressure_vars: tuple[str, ...],
+) -> xr.Dataset:
+    """Build a Dask-backed empty template for compute=False allocation."""
+    import dask.array as da
+
+    date_no_tz = date.replace(tzinfo=None)
+    n_steps = lead_time // 6
+    coords = {
+        "ensemble_member": np.arange(n_members, dtype=np.int64),
+        "init_time": (
+            "init_time",
+            [date_no_tz],
+            {"standard_name": "forecast_reference_time"},
+        ),
+        "lead_time": (
+            "lead_time",
+            [datetime.timedelta(hours=6 * (i + 1)) for i in range(n_steps)],
+            {"standard_name": "forecast_period"},
+        ),
+        "lat": ("lat", LAT, {"standard_name": "latitude", "axis": "Y"}),
+        "lon": ("lon", LON, {"standard_name": "longitude", "axis": "X"}),
+        "pressure": PRESSURE_LEVELS,
+    }
+    surface_dims = ("ensemble_member", "init_time", "lead_time", "lat", "lon")
+    surface_shape = (n_members, 1, n_steps, LAT.size, LON.size)
+    surface_chunks = (1, 1, n_steps, 320, 320)
+
+    pressure_dims = (
+        "ensemble_member",
+        "init_time",
+        "lead_time",
+        "pressure",
+        "lat",
+        "lon",
+    )
+    pressure_shape = (n_members, 1, n_steps, len(PRESSURE_LEVELS), LAT.size, LON.size)
+    pressure_chunks = (1, 1, n_steps, len(PRESSURE_LEVELS), 320, 320)
+
+    data_vars: dict[str, tuple] = {}
+    for v in surface_vars:
+        data_vars[v] = (
+            surface_dims,
+            da.empty(surface_shape, chunks=surface_chunks, dtype="f4"),
+        )
+    for v in pressure_vars:
+        data_vars[v] = (
+            pressure_dims,
+            da.empty(pressure_shape, chunks=pressure_chunks, dtype="f4"),
+        )
+    return xr.Dataset(data_vars, coords=coords)
+
+
+def _chunk_member_ds(ds: xr.Dataset, *, n_steps: int) -> xr.Dataset:
+    """Chunk a per-member ds to the final per-region layout (ensemble_member=1)."""
+    surface_chunk = {
+        "init_time": 1,
+        "lead_time": n_steps,
+        "ensemble_member": 1,
+        "lat": 320,
+        "lon": 320,
+    }
+    pressure_chunk = {**surface_chunk, "pressure": 13}
+    for v in ds.data_vars:
+        target = pressure_chunk if "pressure" in ds[v].dims else surface_chunk
+        ds[v] = ds[v].chunk({k: vv for k, vv in target.items() if k in ds[v].dims})
+        ds[v].encoding.pop("chunks", None)
+        ds[v].encoding.pop("preferred_chunks", None)
+    return ds
+
+
+@app.function(
+    image=infer_image,
     gpu=settings.GPU_TYPE,
     timeout=60 * 60 * 4,
-    volumes={settings.DATA_DIR: data_volume, settings.MODELS_DIR: models_volume},
+    volumes={settings.MODELS_DIR: models_volume},
     secrets=_secrets,
 )
 def run_ensemble_member(
     member_id: int,
     date: datetime.datetime,
     storage_bucket: str,
+    fork: "icechunk.ForkSession",
     *,
-    lead_time: int = 96,
     base_group: str,
-    fork_session,
+    lead_time: int = 96,
     initial_conditions_repo: str | None = None,
     initial_conditions_prefix: str | None = None,
     initial_conditions_branch: str = "main",
     checkpoint: dict | None = None,
     include_pressure_levels: bool = False,
     storage_type: str = "tigris",
-):
-    """Run a single AIFS-ENS ensemble member.
+) -> "icechunk.ForkSession":
+    """Run one ensemble member and region-write its slice into ``fork``.
 
-    Writes into the pre-initialized output arrays using ``region="auto"`` via a
-    ``ForkSession`` and returns it. The orchestrator merges all fork sessions and
-    issues a single commit (cooperative distributed writes).
-
-    Parameters
-    ----------
-    member_id : int
-        Zero-based ensemble member index. Used as the PyTorch random seed for
-        stochastic perturbations, ensuring reproducibility across runs.
-    date : datetime.datetime
-        Forecast initialisation time (analysis time ``t``). AIFS requires two
-        consecutive 6-hourly analyses (``t-6h`` and ``t``) as initial conditions.
-    storage_bucket : str
-        S3/Tigris bucket name used for both the initial conditions and output
-        icechunk repositories when not using ArrayLake.
-    lead_time : int, optional
-        Total forecast lead time in hours. Must be a multiple of 6. Default 96.
-    base_group : str
-        Zarr group path within the outputs repository where the forecast is stored,
-        typically ``"YYYY-MM-DD/HHz"``.
-    fork_session : icechunk.ForkSession
-        Forked icechunk session (from ``session.fork()``) used for cooperative
-        distributed writes. Each member writes its slice and returns the fork;
-        the orchestrator merges all forks and commits once.
-    initial_conditions_repo : str or None, optional
-        Earthmover/ArrayLake repository name (``"org/repo"``) for initial
-        conditions. When set, ICs are pulled directly from ArrayLake and
-        ``ARRAYLAKE_API_TOKEN`` must be available in the environment.
-        Mutually exclusive with ``initial_conditions_prefix``.
-    initial_conditions_prefix : str or None, optional
-        Object-storage prefix within ``storage_bucket`` for the self-managed
-        initial conditions icechunk repository. Used when not reading from
-        ArrayLake.
-    initial_conditions_branch : str, optional
-        Branch name in the initial conditions repository. Default ``"main"``.
-    checkpoint : dict or None, optional
-        Anemoi-inference checkpoint descriptor, e.g.
-        ``{"huggingface": "ecmwf/aifs-ens-1.0"}``. Defaults to the AIFS-ENS
-        checkpoint defined in ``settings``.
-    include_pressure_levels : bool, optional
-        If ``True``, pressure-level variables (``q``, ``t``, ``u``, ``v``,
-        ``w``, ``z`` on 13 levels) are included in the output. Default ``False``.
-    storage_type : {"tigris", "s3", "r2", "gcs", "azure"}, optional
-        Object-storage backend for the initial conditions repository (ignored
-        when ``initial_conditions_repo`` is set). Default ``"tigris"``.
-
-    Returns
-    -------
-    icechunk.ForkSession
-        The fork session after writing the member's output slice, to be merged
-        by the orchestrator.
+    The output store + template are pre-allocated by the orchestrator, so each
+    member just writes ``region={"ensemble_member": slice(m, m+1)}`` and
+    returns the mutated fork.
     """
-    # 1. load initial conditions
+    from anemoi.inference.runners.simple import SimpleRunner
+
     ic_session = _load_initial_conditions(
         storage_bucket,
         initial_conditions_repo=initial_conditions_repo,
@@ -508,40 +753,50 @@ def run_ensemble_member(
         initial_conditions_branch=initial_conditions_branch,
         storage_type=storage_type,
     )
-    # 2. inference
-    member_ds = _run_member(
+    print(f"member {member_id}: loading initial conditions for {date}")
+    fields = ic.fetch_initial_conditions(date, ic_session)
+    if checkpoint is None:
+        checkpoint = settings.AIFS_ENS_CHECKPOINT
+    runner = SimpleRunner(checkpoint, device="cuda")
+    regridder = get_gpu_regridder({"grid": "N320"}, {"grid": (0.25, 0.25)})
+
+    ds = _run_member(
         date,
-        ic_session,
-        checkpoint,
+        runner,
+        fields,
+        regridder,
         member_id=member_id,
         lead_time=lead_time,
         include_pressure_levels=include_pressure_levels,
     )
+    ds = _chunk_member_ds(ds, n_steps=lead_time // 6)
+    ds = _drop_regionless_coords(ds, "ensemble_member")
 
-    # 3. write slice to fork session (no commit)
-    member_ds.to_zarr(
-        fork_session.store,
+    ds.to_zarr(
+        fork.store,
         group=base_group,
         zarr_format=3,
         consolidated=False,
-        region="auto",
+        region={"ensemble_member": slice(member_id, member_id + 1)},
     )
-    print(f"member {member_id}: wrote slice to {base_group}")
-    del member_ds
-    return fork_session
+    print(f"member {member_id}: wrote region")
+    return fork
 
 
 @app.function(
-    image=image,
-    timeout=60 * 60 * 4,
+    image=infer_image,
+    timeout=60 * 60 * 6,
+    volumes={settings.MODELS_DIR: models_volume},
     secrets=_secrets,
 )
-def run_ensemble_forecast(
+def run_forecast(
     date: datetime.datetime,
     storage_bucket: str,
     *,
-    n_members: int,
-    lead_time: int = 96,
+    source: str | None = None,
+    source_repo: str | None = None,
+    source_branch: str = "main",
+    lead_time: int | None = None,
     initial_conditions_repo: str | None = None,
     initial_conditions_prefix: str | None = None,
     initial_conditions_branch: str = "main",
@@ -549,72 +804,84 @@ def run_ensemble_forecast(
     outputs_prefix: str | None = None,
     outputs_branch: str = "main",
     checkpoint: dict | None = None,
+    n_members: int | None = None,
+    parallel_members: bool = True,
     include_pressure_levels: bool = False,
     overwrite: bool = False,
     storage_type: str = "tigris",
 ) -> None:
-    """Run an AIFS-ENS ensemble forecast in parallel, one GPU per member.
+    """CPU orchestrator: ingest initial conditions if absent, then run AIFS inference.
 
-    Uses icechunk cooperative distributed writes: a dedicated CPU function
-    initializes the output arrays from checkpoint metadata (no inference needed),
-    then all members run concurrently, write their slice with ``region="auto"``,
-    and return their fork session. The orchestrator merges all forks and issues a
-    single commit.
+    Ingestion (CPU/IO-bound) runs in this container; AIFS inference is
+    dispatched to a separate GPU container, so GPU billing is limited to
+    inference only.
 
-    The function is idempotent: if the output group already contains at least
-    ``n_members`` ensemble members it exits early without spawning any containers,
-    unless ``overwrite=True``.
+    Modes:
+
+    - ``n_members=None`` — deterministic forecast (AIFS-Single by default).
+    - ``n_members=k, parallel_members=False`` — ``k`` ensemble members
+      sequentially on a single GPU (cheaper for small ``k``; reuses one runner).
+    - ``n_members=k, parallel_members=True`` — ``k`` ensemble members in
+      parallel, one GPU per member, using icechunk fork/merge writes.
 
     Parameters
     ----------
-    date : datetime.datetime
-        Forecast initialisation time (analysis time ``t``). AIFS requires two
-        consecutive 6-hourly analyses (``t-6h`` and ``t``) as initial conditions.
-    storage_bucket : str
-        S3/Tigris bucket name used for both the initial conditions and output
-        icechunk repositories when not using ArrayLake.
-    n_members : int
-        Number of ensemble members to run. Each member gets its own GPU container
-        and uses its zero-based index as the PyTorch random seed.
-    lead_time : int, optional
-        Total forecast lead time in hours. Must be a multiple of 6. Default 96.
-    initial_conditions_repo : str or None, optional
-        Earthmover/ArrayLake repository name (``"org/repo"``) for initial
-        conditions. When set, ICs are pulled directly from ArrayLake and
-        ``ARRAYLAKE_API_TOKEN`` must be available in the environment.
-        Mutually exclusive with ``initial_conditions_prefix``.
-    initial_conditions_prefix : str or None, optional
-        Object-storage prefix within ``storage_bucket`` for the self-managed
-        initial conditions icechunk repository.
-    initial_conditions_branch : str, optional
-        Branch name in the initial conditions repository. Default ``"main"``.
-    outputs_repo : str or None, optional
-        Earthmover/ArrayLake repository name (``"org/repo"``) for forecast
-        outputs. When set, outputs are written to ArrayLake and
-        ``ARRAYLAKE_API_TOKEN`` must be available in the environment.
-        Mutually exclusive with ``outputs_prefix``.
-    outputs_prefix : str or None, optional
-        Object-storage prefix within ``storage_bucket`` for the self-managed
-        outputs icechunk repository.
-    outputs_branch : str, optional
-        Branch name in the outputs repository. Created from ``"main"`` if it
-        does not yet exist. Default ``"main"``.
-    checkpoint : dict or None, optional
-        Anemoi-inference checkpoint descriptor, e.g.
-        ``{"huggingface": "ecmwf/aifs-ens-1.0"}``. Defaults to the AIFS-ENS
-        checkpoint defined in ``settings``.
-    include_pressure_levels : bool, optional
-        If ``True``, pressure-level variables (``q``, ``t``, ``u``, ``v``,
-        ``w``, ``z`` on 13 levels) are included in the output. Default ``False``.
-    overwrite : bool, optional
-        If ``True``, re-run the forecast even if the output group already exists.
-        Default ``False``.
-    storage_type : {"tigris", "s3", "r2", "gcs", "azure"}, optional
-        Object-storage backend for both the initial conditions and outputs
-        repositories (ignored when the corresponding ``*_repo`` parameter is
-        set). Default ``"tigris"``.
+    source : str, optional
+        One of :data:`aifs_modal.settings.IC_SOURCES`. Defaults to
+        :data:`aifs_modal.settings.DEFAULT_IC_SOURCE`.  ICs already present in
+        the target repo are skipped.
+    source_repo : str, optional
+        ArrayLake repository name. Required when ``source="ifs-arraylake"``.
+    source_branch : str, optional
+        Branch in the ArrayLake source repository. Default ``"main"``.
+    n_members : int, optional
+        If set, run an ensemble forecast with this many members. If ``None``,
+        run a single deterministic forecast.
+    parallel_members : bool, optional
+        Only meaningful when ``n_members`` is set. If ``True`` (default), run
+        members in parallel on separate GPUs; if ``False``, run them
+        sequentially on one GPU.
     """
-    # set up outputs repo and branch
+    _require_outputs_target(outputs_repo, outputs_prefix)
+    source, initial_conditions_prefix = _resolve_ic(source, initial_conditions_prefix)
+    _ensure_ic_for_forecast(
+        date,
+        storage_bucket,
+        source=source,
+        initial_conditions_prefix=initial_conditions_prefix,
+        initial_conditions_branch=initial_conditions_branch,
+        storage_type=storage_type,
+        source_repo=source_repo,
+        source_branch=source_branch,
+    )
+
+    if n_members is None or not parallel_members:
+        if checkpoint is None:
+            checkpoint = (
+                settings.AIFS_SINGLE_CHECKPOINT
+                if n_members is None
+                else settings.AIFS_ENS_CHECKPOINT
+            )
+        run_inference.remote(
+            date,
+            storage_bucket,
+            checkpoint,
+            lead_time=lead_time,
+            initial_conditions_repo=initial_conditions_repo,
+            initial_conditions_prefix=initial_conditions_prefix,
+            initial_conditions_branch=initial_conditions_branch,
+            outputs_repo=outputs_repo,
+            outputs_prefix=outputs_prefix,
+            outputs_branch=outputs_branch,
+            n_members=n_members,
+            include_pressure_levels=include_pressure_levels,
+            overwrite=overwrite,
+            storage_type=storage_type,
+        )
+        return
+
+    # parallel ensemble path: allocate empty store, fan out one GPU per member,
+    # merge forks
     outputs_repo_obj = _open_outputs_repo(
         storage_bucket,
         outputs_repo=outputs_repo,
@@ -625,7 +892,6 @@ def run_ensemble_forecast(
         base = outputs_repo_obj.readonly_session("main").snapshot_id
         outputs_repo_obj.create_branch(outputs_branch, base)
 
-    # check if ensemble forecast already exists
     base_group = utils.datetime_to_str(date)
     if not overwrite:
         try:
@@ -645,36 +911,43 @@ def run_ensemble_forecast(
         except Exception:
             pass
 
-    # initialize output arrays from checkpoint metadata (CPU, no inference)
-    _initialize_ensemble_store.remote(
+    lead_time = lead_time or 96
+
+    print("introspecting checkpoint output schema")
+    surface_vars, pressure_vars = _introspect_output_schema(
+        checkpoint, include_pressure_levels
+    )
+    print(
+        f"output schema: {len(surface_vars)} surface vars, "
+        f"{len(pressure_vars)} pressure-level prefixes"
+    )
+
+    template = _empty_ensemble_template(
         date,
-        storage_bucket,
         n_members=n_members,
         lead_time=lead_time,
-        base_group=base_group,
-        outputs_repo=outputs_repo,
-        outputs_prefix=outputs_prefix,
-        outputs_branch=outputs_branch,
-        checkpoint=checkpoint,
-        include_pressure_levels=include_pressure_levels,
-        storage_type=storage_type,
+        surface_vars=surface_vars,
+        pressure_vars=pressure_vars,
     )
+    init_session = outputs_repo_obj.writable_session(outputs_branch)
+    template.to_zarr(
+        init_session.store,
+        group=base_group,
+        zarr_format=3,
+        consolidated=False,
+        compute=False,
+        mode="w",
+    )
+    init_session.commit(
+        f"initialized ensemble forecast for {base_group} ({n_members} members)"
+    )
+    print(f"initialized ensemble store for {base_group}")
 
-    # create fork session for cooperative distributed writes
-    outputs_repo_obj = _open_outputs_repo(
-        storage_bucket,
-        outputs_repo=outputs_repo,
-        outputs_prefix=outputs_prefix,
-        storage_type=storage_type,
-    )
     session = outputs_repo_obj.writable_session(outputs_branch)
     fork = session.fork()
-
-    # spawn all members in parallel — each writes its slice to the fork and returns it
     member_kwargs = dict(
-        lead_time=lead_time,
         base_group=base_group,
-        fork_session=fork,
+        lead_time=lead_time,
         initial_conditions_repo=initial_conditions_repo,
         initial_conditions_prefix=initial_conditions_prefix,
         initial_conditions_branch=initial_conditions_branch,
@@ -684,119 +957,58 @@ def run_ensemble_forecast(
     )
     print(f"spawning {n_members} ensemble members in parallel")
     handles = [
-        run_ensemble_member.spawn(m, date, storage_bucket, **member_kwargs)
+        run_ensemble_member.spawn(m, date, storage_bucket, fork, **member_kwargs)
         for m in range(n_members)
     ]
-    fork_sessions = [h.get() for h in handles]
+    returned_forks = [h.get() for h in handles]
 
-    # merge all fork sessions and commit once
-    session.merge(*fork_sessions)
+    session.merge(*returned_forks)
     session.commit(f"ensemble forecast for {base_group} ({n_members} members)")
-    print(f"all {n_members} members merged and committed")
+    print(f"ensemble forecast for {base_group} ({n_members} members) complete")
 
 
 @app.function(
-    image=image,
+    image=infer_image,
     gpu=settings.GPU_TYPE,
     timeout=60 * 60 * 4,
     volumes={settings.DATA_DIR: data_volume, settings.MODELS_DIR: models_volume},
     secrets=_secrets,
 )
-def run_forecast(
+def run_inference(
     date: datetime.datetime,
-    # target_storage_path: str,
     storage_bucket: str,
+    checkpoint: dict,
     *,
-    lead_time: int = 96,
+    lead_time: int | None = None,
     initial_conditions_repo: str | None = None,
     initial_conditions_prefix: str | None = None,
     initial_conditions_branch: str = "main",
     outputs_repo: str | None = None,
     outputs_prefix: str | None = None,
     outputs_branch: str = "main",
-    checkpoint: dict | None = None,
     n_members: int | None = None,
     include_pressure_levels: bool = False,
     overwrite: bool = False,
     storage_type: str = "tigris",
-) -> None:  # dict[str, str]:
-    """Run a deterministic or sequential ensemble AIFS forecast on a single GPU.
+) -> None:
+    """GPU primitive: deterministic or sequential ensemble AIFS forecast.
 
-    When ``n_members`` is ``None`` the AIFS-Single checkpoint is used for a
-    single deterministic run, streaming each 6-hourly step to the output store
-    via a background writer thread. When ``n_members`` is set the AIFS-ENS
-    checkpoint is used and members are run sequentially on the same GPU, each
-    appended along the ``ensemble_member`` dimension.
+    With ``n_members=None`` runs a single deterministic forecast.  With
+    ``n_members=k`` runs ``k`` ensemble members sequentially on one GPU,
+    reusing the same loaded runner across members, and concatenates them along
+    ``ensemble_member`` before a single write.
 
-    The function is idempotent: deterministic runs are skipped if the output
-    group already exists; ensemble runs are skipped when the group already
-    contains at least ``n_members`` members — unless ``overwrite=True``.
-
-    Parameters
-    ----------
-    date : datetime.datetime
-        Forecast initialisation time (analysis time ``t``). AIFS requires two
-        consecutive 6-hourly analyses (``t-6h`` and ``t``) as initial conditions.
-    storage_bucket : str
-        S3/Tigris bucket name used for both the initial conditions and output
-        icechunk repositories when not using ArrayLake.
-    lead_time : int, optional
-        Total forecast lead time in hours. Must be a multiple of 6. Default 96.
-    initial_conditions_repo : str or None, optional
-        Earthmover/ArrayLake repository name (``"org/repo"``) for initial
-        conditions. When set, ICs are pulled directly from ArrayLake and
-        ``ARRAYLAKE_API_TOKEN`` must be available in the environment.
-        Mutually exclusive with ``initial_conditions_prefix``.
-    initial_conditions_prefix : str or None, optional
-        Object-storage prefix within ``storage_bucket`` for the self-managed
-        initial conditions icechunk repository.
-    initial_conditions_branch : str, optional
-        Branch name in the initial conditions repository. Default ``"main"``.
-    outputs_repo : str or None, optional
-        Earthmover/ArrayLake repository name (``"org/repo"``) for forecast
-        outputs. When set, outputs are written to ArrayLake and
-        ``ARRAYLAKE_API_TOKEN`` must be available in the environment.
-        Mutually exclusive with ``outputs_prefix``.
-    outputs_prefix : str or None, optional
-        Object-storage prefix within ``storage_bucket`` for the self-managed
-        outputs icechunk repository.
-    outputs_branch : str, optional
-        Branch name in the outputs repository. Created from ``"main"`` if it
-        does not yet exist. Default ``"main"``.
-    checkpoint : dict or None, optional
-        Anemoi-inference checkpoint descriptor, e.g.
-        ``{"huggingface": "ecmwf/aifs-single-1.1"}``. Defaults to the
-        AIFS-Single checkpoint (deterministic) or AIFS-ENS (when ``n_members``
-        is set), as defined in ``settings``.
-    n_members : int or None, optional
-        Number of ensemble members to run sequentially on a single GPU. If
-        ``None`` (default), a single deterministic forecast is produced.
-    include_pressure_levels : bool, optional
-        If ``True``, pressure-level variables (``q``, ``t``, ``u``, ``v``,
-        ``w``, ``z`` on 13 levels) are included in the output. Default ``False``.
-    overwrite : bool, optional
-        If ``True``, re-run the forecast even if the output group already exists.
-        Default ``False``.
-    storage_type : {"tigris", "s3", "r2", "gcs", "azure"}, optional
-        Object-storage backend for both the initial conditions and outputs
-        repositories (ignored when the corresponding ``*_repo`` parameter is
-        set). Default ``"tigris"``.
+    Initial conditions must be pre-ingested. Use :func:`run_forecast` to ingest
+    (if needed) and dispatch inference in one call.
     """
-    import torch
-    from anemoi.inference.outputs.printer import print_state
     from anemoi.inference.runners.simple import SimpleRunner
 
-    date_no_tz = date.replace(tzinfo=None)
+    _require_outputs_target(outputs_repo, outputs_prefix)
+    if initial_conditions_repo is None and initial_conditions_prefix is None:
+        raise ValueError(
+            "initial_conditions_prefix (or initial_conditions_repo) is required"
+        )
 
-    ic_session = _load_initial_conditions(
-        storage_bucket,
-        initial_conditions_repo=initial_conditions_repo,
-        initial_conditions_prefix=initial_conditions_prefix,
-        initial_conditions_branch=initial_conditions_branch,
-        storage_type=storage_type,
-    )
-
-    # get outputs repo
     outputs_repo_obj = _open_outputs_repo(
         storage_bucket,
         outputs_repo=outputs_repo,
@@ -807,144 +1019,73 @@ def run_forecast(
         base = outputs_repo_obj.readonly_session("main").snapshot_id
         outputs_repo_obj.create_branch(outputs_branch, base)
 
-    # check if requested forecasts already exist
-    # (if a target forecast already exists, do not re-run it)
     base_group = utils.datetime_to_str(date)
 
     if not overwrite:
         readonly_session = outputs_repo_obj.readonly_session(outputs_branch)
-
-        if n_members is not None:
-            # ensemble: check if group already has all members
-            try:
-                existing = xr.open_dataset(
-                    readonly_session.store,
-                    group=base_group,
-                    engine="zarr",
-                    zarr_format=3,
-                    chunks=None,
-                )
-                if existing.sizes.get("ensemble_member", 0) >= n_members:
-                    print(
-                        f"Ensemble forecast already complete for "
-                        f"{date.isoformat()} "
-                        f"({n_members} members); skipping"
-                    )
-                    return
-            except (zarr.errors.GroupNotFoundError, Exception):
-                pass
-        else:
-            # deterministic: check if group exists
-            try:
-                zarr.open_group(
-                    readonly_session.store,
-                    path=base_group,
-                    mode="r",
-                    zarr_format=3,
-                )
+        try:
+            existing = zarr.open_group(
+                readonly_session.store,
+                path=base_group,
+                mode="r",
+                zarr_format=3,
+            )
+            if n_members is None or existing.attrs.get("n_members", 0) >= n_members:
                 print(
                     f"Forecast already exists for {date.isoformat()} "
                     f"(group: {base_group}); skipping"
                 )
                 return
-            except zarr.errors.GroupNotFoundError:
-                pass
+        except zarr.errors.GroupNotFoundError:
+            pass
 
-    outputs_session = outputs_repo_obj.writable_session(outputs_branch)
+    ic_session = _load_initial_conditions(
+        storage_bucket,
+        initial_conditions_repo=initial_conditions_repo,
+        initial_conditions_prefix=initial_conditions_prefix,
+        initial_conditions_branch=initial_conditions_branch,
+        storage_type=storage_type,
+    )
+    print("loading initial conditions for", date)
+    fields = ic.fetch_initial_conditions(date, ic_session)
+    runner = SimpleRunner(checkpoint, device="cuda")
+    regridder = get_gpu_regridder({"grid": "N320"}, {"grid": (0.25, 0.25)})
 
-    # run forecasts
-    if n_members is not None:
-        # sequential ensemble mode (single GPU, one member at a time)
-        for m in range(n_members):
-            member_ds = _run_member(
+    if n_members is None:
+        ds = _run_member(
+            date,
+            runner,
+            fields,
+            regridder,
+            member_id=None,
+            lead_time=lead_time,
+            include_pressure_levels=include_pressure_levels,
+        )
+    else:
+        member_dss = [
+            _run_member(
                 date,
-                ic_session,
-                checkpoint,
+                runner,
+                fields,
+                regridder,
                 member_id=m,
                 lead_time=lead_time,
                 include_pressure_levels=include_pressure_levels,
-            ).chunk()
+            )
+            for m in range(n_members)
+        ]
+        ds = xr.concat(member_dss, dim="ensemble_member")
 
-            if m == 0:
-                member_ds.to_zarr(
-                    outputs_session.store,
-                    group=base_group,
-                    zarr_format=3,
-                    consolidated=False,
-                    mode="w",
-                )
-            else:
-                member_ds.to_zarr(
-                    outputs_session.store,
-                    group=base_group,
-                    zarr_format=3,
-                    consolidated=False,
-                    append_dim="ensemble_member",
-                )
-            del member_ds
-    else:
-        # single (deterministic) mode
-        # stream each lead time to zarr via a background writer thread
-        print("loading initial conditions for", date)
-        fields = ingest.fetch_initial_conditions(date, ic_session)
-        input_state = dict(date=date_no_tz, fields=fields)
+    outputs_session = outputs_repo_obj.writable_session(outputs_branch)
+    ds.to_zarr(
+        outputs_session.store,
+        group=base_group,
+        zarr_format=3,
+        consolidated=False,
+        mode="w",
+    )
 
-        if checkpoint is None:
-            checkpoint = settings.AIFS_SINGLE_CHECKPOINT
-
-        runner = SimpleRunner(checkpoint, device="cuda")
-
-        # filter input fields
-        expected_vars = set(runner.checkpoint.variable_to_input_tensor_index)
-        extra = set(fields) - expected_vars
-        if extra:
-            print(f"dropping {len(extra)} extra variables: {extra}")
-            fields = {k: v for k, v in fields.items() if k in expected_vars}
-            input_state = dict(date=date_no_tz, fields=fields)
-        missing = expected_vars - set(fields)
-        if missing:
-            print(f"{len(missing)} variables computed by runner")
-
-        regridder = get_gpu_regridder({"grid": "N320"}, {"grid": (0.25, 0.25)})
-
-        q = queue.Queue()
-        lock = threading.Lock()
-
-        def worker():
-            while True:
-                (ds, store, group_name, kwargs) = q.get()
-                with lock:
-                    ds.to_zarr(
-                        store,
-                        group=group_name,
-                        zarr_format=3,
-                        consolidated=False,
-                        **kwargs,
-                    )
-                q.task_done()
-
-        threading.Thread(target=worker, daemon=True).start()
-
-        kwargs = {"mode": "w"}
-        for n, state in enumerate(
-            runner.run(input_state=input_state, lead_time=lead_time)
-        ):
-            print_state(state)
-            ds = state_to_xarray(
-                state,
-                regridder=regridder,
-                include_pressure_levels=include_pressure_levels,
-            ).chunk()
-            group = utils.datetime_to_str(date)
-            if n > 0:
-                kwargs = {"mode": "a", "append_dim": "valid_time"}
-            q.put((ds, outputs_session.store, group, kwargs))
-
-        # wait for all I/O tasks to finish
-        q.join()
-
-    torch.cuda.empty_cache()
-    member_str = f" ({n_members} members)" if n_members else ""
+    member_str = f" ({n_members} members, sequential)" if n_members else ""
     commit_msg = (
         f"{lead_time} hour forecast{member_str} for "
         f"{date.strftime('%Y-%m-%d %H:%M')} written to {outputs_repo_obj}"
