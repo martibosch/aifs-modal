@@ -190,35 +190,29 @@ def _get_all_cds(date: datetime.datetime) -> dict[str, np.ndarray]:
 # ---------------------------------------------------------------------------
 
 
-def get_all_data(
-    date: datetime.datetime, *, cds: bool = False
-) -> dict[str, np.ndarray]:
-    """Fetch all variables for *date* from the chosen earthkit source."""
-    return _get_all_cds(date) if cds else _get_all_open_data(date)
-
-
 def ingest(
     start_date: str,
     end_date: str,
     storage_bucket: str,
+    source: str,
     *,
-    cds: bool = False,
     initial_conditions_prefix: str | None = None,
     initial_conditions_branch: str = "main",
     storage_type: str = "tigris",
 ) -> None:
     """Ingest IFS-open-data or ERA5/CDS initial conditions into an icechunk store."""
-
     # fetch_fn = lambda d: get_all_data(d, cds=cds)
-    def fetch_fn(d):
-        return get_all_data(d, cds=cds)
+    if source == "ifs-ekd":
+        fetch_fn = _get_all_open_data
+    else:  # source == "era5-cds"
+        fetch_fn = _get_all_cds
 
     ic.ingest_range(
         start_date,
         end_date,
         storage_bucket,
         fetch_fn,
-        source="era5-cds" if cds else "ifs-ekd",
+        source=source,
         initial_conditions_prefix=initial_conditions_prefix,
         initial_conditions_branch=initial_conditions_branch,
         storage_type=storage_type,
