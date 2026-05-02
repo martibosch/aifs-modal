@@ -17,9 +17,6 @@ DEFAULT_IC_PREFIXES = {
     "ifs-arraylake": "aifs-ics-ifs-arraylake",
 }
 
-# parallel ingestion: use fork/merge above this many dates
-ARCO_PARALLEL_THRESHOLD = 4
-
 # default forecast args
 LEAD_TIME = 96
 

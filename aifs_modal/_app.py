@@ -396,65 +396,6 @@ def _run_member(
 @app.function(
     image=ingest_image,
     region="us-central1",
-    timeout=60 * 30,
-    cpu=4,
-    secrets=_secrets,
-)
-def _ingest_arco_date(
-    date: datetime.datetime,
-    fork_session: "icechunk.ForkSession",
-) -> "icechunk.ForkSession":
-    """Fetch one date from ARCO-ERA5 and write its zarr group into the fork."""
-    from aifs_modal import ingest_arco
-
-    print(f"ingesting ARCO-ERA5 {date.isoformat()}")
-    ic.get_and_store_date(date, fork_session, ingest_arco.get_all_data)
-    return fork_session
-
-
-@app.function(
-    image=ingest_image,
-    region="us-central1",
-    timeout=60 * 60 * 4,
-    secrets=_secrets,
-)
-def _ingest_arco_sequential(
-    start: datetime.datetime,
-    end: datetime.datetime,
-    storage_bucket: str,
-    *,
-    initial_conditions_prefix: str,
-    initial_conditions_branch: str,
-    storage_type: str,
-) -> None:
-    """Sequential ARCO-ERA5 ingestion in a single container.
-
-    Used for small ranges (<= ``_PARALLEL_THRESHOLD`` dates) where fork
-    overhead would outweigh the parallelism benefit.
-    """
-    from aifs_modal import ingest_arco
-    from aifs_modal.ic import _iter_dates_6h
-
-    storage = utils.get_storage(storage_bucket, initial_conditions_prefix, storage_type)
-    repo = icechunk.Repository.open_or_create(storage)
-    session = repo.writable_session(initial_conditions_branch)
-
-    dates = list(_iter_dates_6h(start, end))
-    for i, date in enumerate(dates, start=1):
-        print(f"[{i}/{len(dates)}] ingesting ARCO-ERA5 {date.isoformat()}")
-        ic.get_and_store_date(date, session, ingest_arco.get_all_data)
-
-    commit_msg = (
-        f"Wrote ARCO-ERA5 initial conditions from {start.isoformat()} "
-        f"to {end.isoformat()} ({len(dates)} dates)"
-    )
-    session.commit(commit_msg)
-    print(commit_msg)
-
-
-@app.function(
-    image=ingest_image,
-    region="us-central1",
     timeout=60 * 60 * 4,
     secrets=_secrets,
 )
@@ -466,64 +407,23 @@ def ingest_arco_era5(
     initial_conditions_prefix: str | None = None,
     initial_conditions_branch: str = "main",
     storage_type: str = "tigris",
-    parallel_threshold: int | None = None,
 ) -> None:
-    """ARCO-ERA5 ingestion, co-located with the ``us-central1`` bucket.
-
-    For small ranges (<= ``_PARALLEL_THRESHOLD`` dates) a single container runs
-    sequentially.  For larger ranges one container per date is spawned and the
-    orchestrator merges all forks into a single commit.
-    """
-    from aifs_modal.ic import _iter_dates_6h, _parse_utc_date
+    """ARCO-ERA5 ingestion, co-located with the ``us-central1`` bucket."""
+    from aifs_modal import ingest_arco
 
     if initial_conditions_prefix is None:
         initial_conditions_prefix = settings.DEFAULT_IC_PREFIXES["era5-arco"]
 
-    start = _parse_utc_date(start_date)
-    end = _parse_utc_date(end_date)
-    if end < start:
-        raise ValueError(
-            f"end_date must be >= start_date (got {start_date!r} -> {end_date!r})"
-        )
-
-    storage = utils.get_storage(storage_bucket, initial_conditions_prefix, storage_type)
-    repo = icechunk.Repository.open_or_create(storage)
-
-    if initial_conditions_branch not in repo.list_branches():
-        base = repo.readonly_session("main").snapshot_id
-        repo.create_branch(initial_conditions_branch, base)
-
-    dates = list(_iter_dates_6h(start, end))
-
-    threshold = (
-        parallel_threshold
-        if parallel_threshold is not None
-        else settings.ARCO_PARALLEL_THRESHOLD
+    ic.ingest_range(
+        start_date,
+        end_date,
+        storage_bucket,
+        ingest_arco.get_all_data,
+        source="era5-arco",
+        initial_conditions_prefix=initial_conditions_prefix,
+        initial_conditions_branch=initial_conditions_branch,
+        storage_type=storage_type,
     )
-    if len(dates) <= threshold:
-        _ingest_arco_sequential.remote(
-            start,
-            end,
-            storage_bucket,
-            initial_conditions_prefix=initial_conditions_prefix,
-            initial_conditions_branch=initial_conditions_branch,
-            storage_type=storage_type,
-        )
-    else:
-        session = repo.writable_session(initial_conditions_branch)
-        fork = session.fork()
-
-        print(f"spawning {len(dates)} date workers in us-central1")
-        handles = [_ingest_arco_date.spawn(d, fork) for d in dates]
-        fork_sessions = [h.get() for h in handles]
-
-        session.merge(*fork_sessions)
-        commit_msg = (
-            f"Wrote ARCO-ERA5 initial conditions from {start.isoformat()} "
-            f"to {end.isoformat()} ({len(dates)} dates)"
-        )
-        session.commit(commit_msg)
-        print(commit_msg)
 
 
 # ---------------------------------------------------------------------------
