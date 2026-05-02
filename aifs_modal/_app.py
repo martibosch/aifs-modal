@@ -35,11 +35,11 @@ models_volume = modal.Volume.from_name(
 )
 
 # secrets
-_secrets = [modal.Secret.from_name("aws-credentials")]
-if os.getenv("ARRAYLAKE_API_TOKEN"):
-    _secrets.append(modal.Secret.from_name("arraylake-api-token"))
-if os.getenv("HF_HUB_TOKEN"):
-    _secrets.append(modal.Secret.from_name("huggingface-secret"))
+_secrets = [
+    modal.Secret.from_name("aws-credentials"),
+    modal.Secret.from_name("arraylake-api-token"),
+    modal.Secret.from_name("huggingface-secret"),
+]
 
 app = modal.App(settings.APP_NAME)
 
