@@ -47,17 +47,27 @@ app = modal.App(settings.APP_NAME)
 # Images
 # ---------------------------------------------------------------------------
 
-ingest_image = modal.Image.debian_slim(python_version="3.12").uv_pip_install(
-    "arraylake",
-    "boto3",
-    "dask",
-    "earthkit-data",
-    "earthkit-regrid",
-    "gcsfs",
-    "icechunk",
-    "numpy",
-    "xarray",
-    "zarr",
+ingest_image = (
+    modal.Image.debian_slim(python_version="3.12")
+    .uv_pip_install(
+        "arraylake",
+        "boto3",
+        "dask",
+        "earthkit-data",
+        "earthkit-regrid>=0.5.1,<0.6",
+        "gcsfs",
+        "icechunk>=2.0.3,<3",
+        "numpy",
+        "xarray",
+        "zarr",
+    )
+    .run_commands(
+        # this avoids `ValueError: No matrix found! in_grid={'grid': (0.25, 0.25)}
+        # out_grid={'grid': 'N320'} method='linear'`
+        # TODO: migrate regridding to earthkit-geo
+        "python -c 'import earthkit.regrid.db as db; "
+        'db.SYS_DB.find({"grid": [0.25, 0.25]}, {"grid": "N320"}, "linear")\''
+    )
 )
 
 flash_attn_release = (
@@ -75,10 +85,10 @@ infer_image = (
         "anemoi-utils==0.4.22",
         "arraylake",
         "boto3",
-        "earthkit-regrid",
+        "earthkit-regrid>=0.5.1,<0.6",
         "ecmwf-opendata",
         flash_attn_release,
-        "icechunk",
+        "icechunk>=2.0.3,<3",
         "numpy",
         "torch==2.9.0",
         "torch-geometric==2.4.0",
