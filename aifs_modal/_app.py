@@ -382,8 +382,6 @@ def _run_member(
 # ARCO-ERA5 ingestion (us-central1, CPU)
 # ---------------------------------------------------------------------------
 
-_PARALLEL_THRESHOLD = 4
-
 
 @app.function(
     image=ingest_image,
@@ -458,6 +456,7 @@ def ingest_arco_era5(
     initial_conditions_prefix: str | None = None,
     initial_conditions_branch: str = "main",
     storage_type: str = "tigris",
+    parallel_threshold: int | None = None,
 ) -> None:
     """ARCO-ERA5 ingestion, co-located with the ``us-central1`` bucket.
 
@@ -486,7 +485,12 @@ def ingest_arco_era5(
 
     dates = list(_iter_dates_6h(start, end))
 
-    if len(dates) <= _PARALLEL_THRESHOLD:
+    threshold = (
+        parallel_threshold
+        if parallel_threshold is not None
+        else settings.ARCO_PARALLEL_THRESHOLD
+    )
+    if len(dates) <= threshold:
         _ingest_arco_sequential.remote(
             start,
             end,
