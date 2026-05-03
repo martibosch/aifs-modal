@@ -731,10 +731,13 @@ def run_ensemble_member(
     )
     print(f"member {member_id}: loading initial conditions for {date}")
     fields = ic.fetch_initial_conditions(date, ic_session)
+    print(f"member {member_id}: loading model checkpoint")
     if checkpoint is None:
         checkpoint = settings.AIFS_ENS_CHECKPOINT
     runner = SimpleRunner(checkpoint, device="cuda")
+    print(f"member {member_id}: initializing regridder")
     regridder = get_gpu_regridder({"grid": "N320"}, {"grid": (0.25, 0.25)})
+    print(f"member {member_id}: running inference")
 
     ds = _run_member(
         date,
@@ -1061,8 +1064,11 @@ def run_inference(
     )
     print("loading initial conditions for", date)
     fields = ic.fetch_initial_conditions(date, ic_session)
+    print("loading model checkpoint")
     runner = SimpleRunner(checkpoint, device="cuda")
+    print("initializing regridder")
     regridder = get_gpu_regridder({"grid": "N320"}, {"grid": (0.25, 0.25)})
+    print("running inference")
 
     if n_members is None:
         ds = _run_member(
