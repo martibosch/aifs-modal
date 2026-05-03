@@ -2,14 +2,15 @@
 
     https://app.earthmover.io/marketplace/697162921880507a6587c31b
 
-The source is already a co-aligned zarr cube with chunks per ``init_time`` on
-the 0.25° grid the AIFS runner accepts as input, so unlike the other backends
-(which fetch+regrid per date) this module bypasses :func:`ic.ingest_range` and
-does one batched read over the whole date window, then writes per date.
+The source is a co-aligned zarr cube with chunks per ``init_time`` on the 0.25°
+regular lat/lon grid (721×1440). Unlike the other backends this module does one
+batched read over the whole date window, then regrids each field to the N320
+reduced Gaussian grid and writes per date.
 
-The only transformations on top of the source data are variable name mapping
-to the AIFS convention and the geopotential unit conversion (z in m² s⁻² →
-gh = z / g in m).
+Transformations applied on top of the source data:
+- variable name mapping to the AIFS convention
+- regrid from 0.25° lat/lon to N320 via :func:`ic._regrid_n320`
+- geopotential unit conversion (z in m² s⁻² → gh = z / g in m)
 """
 
 import datetime
@@ -20,7 +21,7 @@ import xarray as xr
 import zarr
 
 from aifs_modal import ic, settings, utils
-from aifs_modal.ic import _G, LEVELS
+from aifs_modal.ic import _G, LEVELS, _regrid_n320
 from aifs_modal.utils import _STORAGE_TYPES
 
 # Surface / single-level vars. Brightband uses ECMWF short names.
@@ -34,11 +35,13 @@ _SFC_MAP = {
     "sp": "sp",
     "tcw": "tcwv",
     "tcwv": "tcwv",
-    "lsm": "lsm",
-    "z": "z",
-    "slor": "slor",
-    "sdor": "sdor",
 }
+
+# TODO: once static vars are merged to the main Brightband branch, read them
+# there and remove source_static_branch from the ingest API.
+_STATIC_BRANCH = "add-static-vars"
+_STATIC_VARS = ["lsm", "z_sfc", "slor", "sdor"]
+_STATIC_RENAME = {"z_sfc": "z"}  # z_sfc → z (surface orography)
 
 _SOIL_MAP = {
     "stl1": "sot_1",
@@ -56,6 +59,17 @@ _PL_PREFIX_MAP = {
     "w": "w",
     "z": "gh",
 }
+
+
+def _read_static_fields(ds_static: xr.Dataset) -> dict[str, np.ndarray]:
+    """Read time-invariant surface fields from the static-vars branch dataset."""
+    data = {}
+    for src in _STATIC_VARS:
+        arr = ds_static[src].values.astype("f4")
+        while arr.ndim > 2:
+            arr = arr.squeeze(axis=0)
+        data[_STATIC_RENAME.get(src, src)] = _regrid_n320(arr)
+    return data
 
 
 def _build_rename_map(ds: xr.Dataset) -> dict[str, str]:
@@ -82,7 +96,7 @@ def _flatten_date(
     data: dict[str, np.ndarray] = {}
     sfc_names = [v for v in date_ds.data_vars if v not in pl_src_prefixes]
     for name in sfc_names:
-        data[name] = date_ds[name].values.astype("f4").ravel()
+        data[name] = _regrid_n320(date_ds[name].values.astype("f4"))
 
     if pl_src_prefixes:
         ds_levels = date_ds["level"].values
@@ -94,17 +108,24 @@ def _flatten_date(
             if aifs_prefix == "gh":
                 arr = arr / _G
             for i, level in enumerate(LEVELS):
-                data[f"{aifs_prefix}_{level}"] = arr[i].ravel()
+                data[f"{aifs_prefix}_{level}"] = _regrid_n320(arr[i])
     return data
 
 
-def get_all_data(ds: xr.Dataset, init_time: datetime.datetime) -> dict[str, np.ndarray]:
+def get_all_data(
+    ds: xr.Dataset,
+    init_time: datetime.datetime,
+    static_data: dict[str, np.ndarray] | None = None,
+) -> dict[str, np.ndarray]:
     """Fetch one date's variables. Per-date path used at forecast time."""
     init_time = init_time.replace(tzinfo=None)
     src = ds.sel(init_time=init_time).isel(lead_time=0)
     src = src.rename(_build_rename_map(src))
     src = src.compute()
-    return _flatten_date(src, _pl_src_prefixes(src))
+    data = _flatten_date(src, _pl_src_prefixes(src))
+    if static_data:
+        data.update(static_data)
+    return data
 
 
 def ingest(
@@ -115,6 +136,7 @@ def ingest(
     client,
     source_repo: str,
     source_branch: str = "main",
+    source_static_branch: str = _STATIC_BRANCH,
     initial_conditions_prefix: str | None = None,
     initial_conditions_branch: str = "main",
     storage_type: str = "tigris",
@@ -129,6 +151,9 @@ def ingest(
         ArrayLake repository name (e.g. ``"brightband/ecmwf-ifs-initial-conditions"``).
     source_branch : str, optional
         Branch in the source repository. Default ``"main"``.
+    source_static_branch : str, optional
+        Branch that carries the time-invariant surface fields (``lsm``, ``z``,
+        ``slor``, ``sdor``). Default ``"add-static-vars"``.
     """
     from aifs_modal.ic import _iter_dates_6h, _parse_utc_date
 
@@ -146,11 +171,16 @@ def ingest(
     if initial_conditions_prefix is None:
         initial_conditions_prefix = settings.DEFAULT_IC_PREFIXES["ifs-arraylake"]
 
-    source = client.get_repo(source_repo)
-    source_session = source.readonly_session(source_branch)
+    al_repo = client.get_repo(source_repo)
+    source_session = al_repo.readonly_session(source_branch)
     source_ds = xr.open_dataset(
         source_session.store, engine="zarr", zarr_format=3, chunks={}
     )
+    static_session = al_repo.readonly_session(source_static_branch)
+    static_ds = xr.open_dataset(
+        static_session.store, engine="zarr", zarr_format=3, chunks={}
+    )
+    static_data = _read_static_fields(static_ds)
 
     storage = utils.get_storage(storage_bucket, initial_conditions_prefix, storage_type)
     repo = icechunk.Repository.open_or_create(storage)
@@ -193,6 +223,7 @@ def ingest(
         print(f"[{i}/{len(missing)}] writing {date.isoformat()}")
         date_ds = src.sel(init_time=np.datetime64(date.replace(tzinfo=None), "ns"))
         data = _flatten_date(date_ds, pl_src_prefixes)
+        data.update(static_data)
         ic.get_and_store_date(date, session, lambda _d, _data=data: _data)
 
     commit_msg = (

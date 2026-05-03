@@ -12,6 +12,7 @@ __all__ = [
     "app",
     "ingest",
     "ingest_arco_era5",
+    "ingest_ifs_arraylake",
     "run_forecast",
     "settings",
 ]

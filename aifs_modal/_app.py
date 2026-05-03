@@ -9,9 +9,10 @@ Two images on the same app:
     CUDA + torch + flash-attn image used by inference functions and the
     CPU-side orchestrators that share its dependencies.
 
-Open-data and CDS-based ingestion don't need a dedicated image: ``run_forecast``
-already does that work CPU-side inside ``infer_image``, gated by
-``_ensure_ic_for_forecast``.
+Open-data and CDS-based ingestion (``ifs-ekd``, ``era5-cds``) runs inline in
+``run_forecast`` when ICs are missing. ARCO and ArrayLake sources are dispatched
+to their dedicated co-located functions (``ingest_era5_arco``,
+``ingest_ifs_arraylake``).
 """
 
 import contextlib
@@ -395,6 +396,63 @@ def _run_member(
 
 @app.function(
     image=ingest_image,
+    region="us-east",
+    timeout=60 * 60 * 4,
+    secrets=_secrets,
+)
+def ingest_ifs_arraylake(
+    start_date: str,
+    end_date: str,
+    storage_bucket: str,
+    *,
+    source_repo: str,
+    source_branch: str = "main",
+    source_static_branch: str = "add-static-vars",
+    initial_conditions_prefix: str | None = None,
+    initial_conditions_branch: str = "main",
+    storage_type: str = "tigris",
+) -> None:
+    """IFS-arraylake ingestion, co-located with the Cloudflare R2 ENAM bucket."""
+    import arraylake as al
+
+    from aifs_modal import ingest_arraylake
+
+    with _without_aws_env():
+        al_client = al.Client(token=os.environ["ARRAYLAKE_API_TOKEN"])
+    al_repo = al_client.get_repo(source_repo)
+    source_ds = xr.open_dataset(
+        al_repo.readonly_session(source_branch).store,
+        engine="zarr",
+        zarr_format=3,
+        chunks={},
+    )
+    # TODO: remove source_static_branch once static vars are merged to main
+    static_ds = xr.open_dataset(
+        al_repo.readonly_session(source_static_branch).store,
+        engine="zarr",
+        zarr_format=3,
+        chunks={},
+    )
+    static_data = ingest_arraylake._read_static_fields(static_ds)
+    fetch_fn = lambda d: ingest_arraylake.get_all_data(source_ds, d, static_data)  # noqa: E731
+
+    if initial_conditions_prefix is None:
+        initial_conditions_prefix = settings.DEFAULT_IC_PREFIXES["ifs-arraylake"]
+
+    ic.ingest_range(
+        start_date,
+        end_date,
+        storage_bucket,
+        fetch_fn,
+        source="ifs-arraylake",
+        initial_conditions_prefix=initial_conditions_prefix,
+        initial_conditions_branch=initial_conditions_branch,
+        storage_type=storage_type,
+    )
+
+
+@app.function(
+    image=ingest_image,
     region="us-central1",
     timeout=60 * 60 * 4,
     secrets=_secrets,
@@ -710,6 +768,7 @@ def run_forecast(
     source: str | None = None,
     source_repo: str | None = None,
     source_branch: str = "main",
+    source_static_branch: str = "add-static-vars",
     lead_time: int | None = None,
     initial_conditions_repo: str | None = None,
     initial_conditions_prefix: str | None = None,
@@ -726,9 +785,11 @@ def run_forecast(
 ) -> None:
     """CPU orchestrator: ingest initial conditions if absent, then run AIFS inference.
 
-    Ingestion (CPU/IO-bound) runs in this container; AIFS inference is
-    dispatched to a separate GPU container, so GPU billing is limited to
-    inference only.
+    If ICs are missing, ingestion is dispatched to the appropriate Modal
+    function: ``ingest_era5_arco`` (us-central1) for ``era5-arco``,
+    ``ingest_ifs_arraylake`` (us-east) for ``ifs-arraylake``, or inline for
+    ``ifs-ekd``/``era5-cds``. AIFS inference is dispatched to a separate GPU
+    container, so GPU billing is limited to inference only.
 
     Modes:
 
