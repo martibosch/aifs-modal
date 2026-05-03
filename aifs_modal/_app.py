@@ -457,7 +457,7 @@ def ingest_ifs_arraylake(
     timeout=60 * 60 * 4,
     secrets=_secrets,
 )
-def ingest_arco_era5(
+def ingest_era5_arco(
     start_date: str,
     end_date: str,
     storage_bucket: str,
