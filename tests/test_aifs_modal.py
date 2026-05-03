@@ -9,17 +9,17 @@ import numpy as np
 import zarr
 
 from aifs_modal import utils
-from aifs_modal.ic import (
+from aifs_modal._ic import (
     LEVELS,
     _iter_dates_6h,
     _parse_utc_date,
     fetch_initial_conditions,
     ingest_range,
 )
-from aifs_modal.ic import (
+from aifs_modal._ic import (
     _stack_fields as stack_fields,
 )
-from aifs_modal.ic import (
+from aifs_modal._ic import (
     _store_data as store_data,
 )
 from aifs_modal.ingest_ekd import (
@@ -205,7 +205,7 @@ class TestIngestRange(unittest.TestCase):
             initial_conditions_prefix="unused",
         )
 
-        with mock.patch("aifs_modal.ic.utils.get_storage", return_value=storage):
+        with mock.patch("aifs_modal._ic.utils.get_storage", return_value=storage):
             ingest_range(**kwargs)
             ingest_range(**kwargs)
 

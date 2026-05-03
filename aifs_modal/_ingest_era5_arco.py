@@ -12,7 +12,7 @@ back-fill, ~5-day lag).
     so every time-step read transfers a full ~4 MB global field regardless of
     any spatial subset.  This module is most efficient when run on GCP
     infrastructure co-located with the ``us-central1`` bucket.  For use from
-    outside GCP, consider :mod:`aifs_modal.ingest_ekd` with ``cds=True``.
+    outside GCP, consider :mod:`aifs_modal._ingest_ekd` with ``cds=True``.
 
 References
 ----------
@@ -27,8 +27,8 @@ import gcsfs
 import numpy as np
 import zarr
 
-from aifs_modal import ic
-from aifs_modal.ic import _G, LEVELS, _regrid_n320
+from aifs_modal import _ic as ic
+from aifs_modal._ic import _G, LEVELS, _regrid_n320
 
 _ARCO_PATH = "gcp-public-data-arco-era5/ar/full_37-1h-0p25deg-chunk-1.zarr-v3"
 

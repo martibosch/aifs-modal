@@ -16,8 +16,8 @@ import datetime
 import earthkit.data as ekd
 import numpy as np
 
-from aifs_modal import ic
-from aifs_modal.ic import _G, LEVELS, _regrid_n320
+from aifs_modal import _ic as ic
+from aifs_modal._ic import _G, LEVELS, _regrid_n320
 
 # --- ECMWF open-data param lists (GRIB short names) ---
 PARAM_SFC = [

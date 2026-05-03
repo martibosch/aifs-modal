@@ -27,7 +27,9 @@ import numpy as np
 import xarray as xr
 import zarr
 
-from aifs_modal import ic, ingest_ekd, settings, utils
+from aifs_modal import _ic as ic
+from aifs_modal import _ingest_ekd as ingest_ekd
+from aifs_modal import settings, utils
 
 # volumes
 data_volume = modal.Volume.from_name(settings.DATA_VOLUME_NAME, create_if_missing=True)
@@ -226,14 +228,14 @@ def _make_fetch_fn(
     if source == "era5-cds":
         return lambda d: ingest_ekd.get_all_data(d, cds=True)
     if source == "era5-arco":
-        from aifs_modal import ingest_arco
+        from aifs_modal import _ingest_era5_arco as ingest_arco
 
         # ACHTUNG: import here because of optional `gcsfs` dep
         return ingest_arco.get_all_data
     if source == "ifs-arraylake":
         import arraylake as al
 
-        from aifs_modal import ingest_arraylake
+        from aifs_modal import _ingest_ifs_arraylake as ingest_arraylake
 
         # ACHTUNG: import here because of optional `arraylake` dep
         if source_repo is None:
@@ -419,7 +421,7 @@ def ingest_ifs_arraylake(
     """IFS-arraylake ingestion, co-located with the Cloudflare R2 ENAM bucket."""
     import arraylake as al
 
-    from aifs_modal import ingest_arraylake
+    from aifs_modal import _ingest_ifs_arraylake as ingest_arraylake
 
     with _without_aws_env():
         al_client = al.Client(token=os.environ["ARRAYLAKE_API_TOKEN"])
@@ -471,7 +473,7 @@ def ingest_era5_arco(
     storage_type: str = "tigris",
 ) -> None:
     """ARCO-ERA5 ingestion, co-located with the ``us-central1`` bucket."""
-    from aifs_modal import ingest_arco
+    from aifs_modal import _ingest_era5_arco as ingest_arco
 
     if initial_conditions_prefix is None:
         initial_conditions_prefix = settings.DEFAULT_IC_PREFIXES["era5-arco"]

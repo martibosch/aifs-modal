@@ -20,8 +20,9 @@ import numpy as np
 import xarray as xr
 import zarr
 
-from aifs_modal import ic, settings, utils
-from aifs_modal.ic import _G, LEVELS, _regrid_n320
+from aifs_modal import _ic as ic
+from aifs_modal import settings, utils
+from aifs_modal._ic import _G, LEVELS, _regrid_n320
 from aifs_modal.utils import _STORAGE_TYPES
 
 # Surface / single-level vars. Brightband uses ECMWF short names.
@@ -155,7 +156,7 @@ def ingest(
         Branch that carries the time-invariant surface fields (``lsm``, ``z``,
         ``slor``, ``sdor``). Default ``"add-static-vars"``.
     """
-    from aifs_modal.ic import _iter_dates_6h, _parse_utc_date
+    from aifs_modal._ic import _iter_dates_6h, _parse_utc_date
 
     start = _parse_utc_date(start_date)
     end = _parse_utc_date(end_date)
