@@ -36,6 +36,7 @@ data_volume = modal.Volume.from_name(settings.DATA_VOLUME_NAME, create_if_missin
 models_volume = modal.Volume.from_name(
     settings.MODELS_VOLUME_NAME, create_if_missing=True
 )
+ic_volume = modal.Volume.from_name(settings.IC_VOLUME_NAME, create_if_missing=True)
 
 # secrets
 _secrets = [
@@ -45,6 +46,27 @@ _secrets = [
 ]
 
 app = modal.App(settings.APP_NAME)
+
+
+@app.local_entrypoint()
+def create_volumes() -> None:
+    """Create Modal Volumes required by aifs-modal (idempotent, safe to re-run).
+
+    Run once during first-time setup::
+
+        modal run -m aifs_modal._app
+
+    This forces each volume to be hydrated (created if missing) so that
+    subsequent ``app.run()`` calls can resolve all dependency object IDs.
+    """
+    for name, vol in [
+        (settings.DATA_VOLUME_NAME, data_volume),
+        (settings.MODELS_VOLUME_NAME, models_volume),
+        (settings.IC_VOLUME_NAME, ic_volume),
+    ]:
+        vol.hydrate()
+        print(f"  {name}: ok")
+
 
 # ---------------------------------------------------------------------------
 # Images
@@ -252,17 +274,6 @@ def _make_fetch_fn(
     )
 
 
-def _resolve_ic(
-    source: str | None, initial_conditions_prefix: str | None
-) -> tuple[str, str]:
-    """Resolve ``(source, prefix)`` defaults from :mod:`aifs_modal.settings`."""
-    if source is None:
-        source = settings.DEFAULT_IC_SOURCE
-    if initial_conditions_prefix is None:
-        initial_conditions_prefix = settings.DEFAULT_IC_PREFIXES[source]
-    return source, initial_conditions_prefix
-
-
 def _require_outputs_target(
     outputs_repo: str | None, outputs_prefix: str | None
 ) -> None:
@@ -275,30 +286,10 @@ def _require_outputs_target(
         )
 
 
-def _ic_dates_present(
-    date: datetime.datetime,
-    storage_bucket: str,
-    *,
-    initial_conditions_prefix: str,
-    initial_conditions_branch: str,
-    storage_type: str,
-) -> bool:
-    """Return True if ICs for *date* and *date−6h* are already committed."""
-    storage = utils.get_storage(storage_bucket, initial_conditions_prefix, storage_type)
-    try:
-        repo = icechunk.Repository.open(storage)
-    except Exception:
-        return False
-    session = repo.readonly_session(initial_conditions_branch)
-    for ic_date in [date - datetime.timedelta(hours=6), date]:
-        try:
-            zarr.open_group(
-                session.store,
-                path=utils.datetime_to_str(ic_date),
-                mode="r",
-                zarr_format=3,
-            )
-        except zarr.errors.GroupNotFoundError:
+def _ic_dates_present(date: datetime.datetime, ic_dir: str) -> bool:
+    """Return True if ICs for *date* and *date−6h* are both on the volume."""
+    for d in [date - datetime.timedelta(hours=6), date]:
+        if not os.path.exists(os.path.join(ic_dir, utils.datetime_to_str(d))):
             return False
     return True
 
@@ -322,29 +313,6 @@ def _open_outputs_repo(
     return icechunk.Repository.open_or_create(
         utils.get_storage(storage_bucket, outputs_prefix, storage_type)
     )
-
-
-def _load_initial_conditions(
-    storage_bucket: str,
-    *,
-    initial_conditions_repo: str | None = None,
-    initial_conditions_prefix: str | None = None,
-    initial_conditions_branch: str = "main",
-    storage_type: str = "tigris",
-):
-    """Return a readonly icechunk session for initial conditions."""
-    if initial_conditions_repo is not None:
-        import arraylake as al
-
-        with _without_aws_env():
-            client = al.Client(token=os.environ["ARRAYLAKE_API_TOKEN"])
-            config = icechunk.RepositoryConfig.default()
-            return client.get_repo(
-                initial_conditions_repo, config=config
-            ).readonly_session(initial_conditions_branch)
-    return icechunk.Repository.open(
-        utils.get_storage(storage_bucket, initial_conditions_prefix, storage_type)
-    ).readonly_session(initial_conditions_branch)
 
 
 def _run_member(
@@ -405,18 +373,15 @@ def _run_member(
     region="us-east",
     timeout=60 * 60 * 4,
     secrets=_secrets,
+    volumes={settings.IC_DIR: ic_volume},
 )
 def ingest_ifs_arraylake(
     start_date: str,
     end_date: str,
-    storage_bucket: str,
     *,
     source_repo: str,
     source_branch: str = "main",
     source_static_branch: str = "add-static-vars",
-    initial_conditions_prefix: str | None = None,
-    initial_conditions_branch: str = "main",
-    storage_type: str = "tigris",
 ) -> None:
     """IFS-arraylake ingestion, co-located with the Cloudflare R2 ENAM bucket."""
     import arraylake as al
@@ -440,21 +405,15 @@ def ingest_ifs_arraylake(
         chunks={},
     )
     static_data = ingest_arraylake._read_static_fields(static_ds)
-    fetch_fn = lambda d: ingest_arraylake.get_all_data(source_ds, d, static_data)  # noqa: E731
 
-    if initial_conditions_prefix is None:
-        initial_conditions_prefix = settings.DEFAULT_IC_PREFIXES["ifs-arraylake"]
+    # fetch_fn = lambda d: ingest_arraylake.get_all_data(source_ds, d, static_data)
+    def fetch_fn(d):
+        return ingest_arraylake.get_all_data(source_ds, d, static_data)
 
     ic.ingest_range(
-        start_date,
-        end_date,
-        storage_bucket,
-        fetch_fn,
-        source="ifs-arraylake",
-        initial_conditions_prefix=initial_conditions_prefix,
-        initial_conditions_branch=initial_conditions_branch,
-        storage_type=storage_type,
+        start_date, end_date, settings.IC_DIR, fetch_fn, source="ifs-arraylake"
     )
+    ic_volume.commit()
 
 
 @app.function(
@@ -462,32 +421,23 @@ def ingest_ifs_arraylake(
     region="us-central1",
     timeout=60 * 60 * 4,
     secrets=_secrets,
+    volumes={settings.IC_DIR: ic_volume},
 )
 def ingest_era5_arco(
     start_date: str,
     end_date: str,
-    storage_bucket: str,
-    *,
-    initial_conditions_prefix: str | None = None,
-    initial_conditions_branch: str = "main",
-    storage_type: str = "tigris",
 ) -> None:
     """ARCO-ERA5 ingestion, co-located with the ``us-central1`` bucket."""
     from aifs_modal import _ingest_era5_arco as ingest_arco
 
-    if initial_conditions_prefix is None:
-        initial_conditions_prefix = settings.DEFAULT_IC_PREFIXES["era5-arco"]
-
     ic.ingest_range(
         start_date,
         end_date,
-        storage_bucket,
+        settings.IC_DIR,
         ingest_arco.get_all_data,
         source="era5-arco",
-        initial_conditions_prefix=initial_conditions_prefix,
-        initial_conditions_branch=initial_conditions_branch,
-        storage_type=storage_type,
     )
+    ic_volume.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -698,23 +648,18 @@ def _chunk_member_ds(ds: xr.Dataset, *, n_steps: int) -> xr.Dataset:
     image=infer_image,
     gpu=settings.GPU_TYPE,
     timeout=60 * 60 * 4,
-    volumes={settings.MODELS_DIR: models_volume},
+    volumes={settings.MODELS_DIR: models_volume, settings.IC_DIR: ic_volume},
     secrets=_secrets,
 )
 def run_ensemble_member(
     member_id: int,
     date: datetime.datetime,
-    storage_bucket: str,
     fork: "icechunk.ForkSession",
     *,
     base_group: str,
     lead_time: int = 96,
-    initial_conditions_repo: str | None = None,
-    initial_conditions_prefix: str | None = None,
-    initial_conditions_branch: str = "main",
     checkpoint: dict | None = None,
     include_pressure_levels: bool = False,
-    storage_type: str = "tigris",
 ) -> "icechunk.ForkSession":
     """Run one ensemble member and region-write its slice into ``fork``.
 
@@ -724,15 +669,9 @@ def run_ensemble_member(
     """
     from anemoi.inference.runners.simple import SimpleRunner
 
-    ic_session = _load_initial_conditions(
-        storage_bucket,
-        initial_conditions_repo=initial_conditions_repo,
-        initial_conditions_prefix=initial_conditions_prefix,
-        initial_conditions_branch=initial_conditions_branch,
-        storage_type=storage_type,
-    )
+    ic_volume.reload()
     print(f"member {member_id}: loading initial conditions for {date}")
-    fields = ic.fetch_initial_conditions(date, ic_session)
+    fields = ic.fetch_initial_conditions(date, settings.IC_DIR)
     print(f"member {member_id}: loading model checkpoint")
     if checkpoint is None:
         checkpoint = settings.AIFS_ENS_CHECKPOINT
@@ -767,7 +706,7 @@ def run_ensemble_member(
 @app.function(
     image=infer_image,
     timeout=60 * 60 * 6,
-    volumes={settings.MODELS_DIR: models_volume},
+    volumes={settings.MODELS_DIR: models_volume, settings.IC_DIR: ic_volume},
     secrets=_secrets,
 )
 def run_forecast(
@@ -779,9 +718,6 @@ def run_forecast(
     source_branch: str = "main",
     source_static_branch: str = "add-static-vars",
     lead_time: int | None = None,
-    initial_conditions_repo: str | None = None,
-    initial_conditions_prefix: str | None = None,
-    initial_conditions_branch: str = "main",
     outputs_repo: str | None = None,
     outputs_prefix: str | None = None,
     outputs_branch: str = "main",
@@ -790,6 +726,7 @@ def run_forecast(
     parallel_members: bool = True,
     include_pressure_levels: bool = False,
     overwrite: bool = False,
+    keep_ics: bool = False,
     storage_type: str = "tigris",
 ) -> None:
     """CPU orchestrator: ingest initial conditions if absent, then run AIFS inference.
@@ -813,11 +750,14 @@ def run_forecast(
     source : str, optional
         One of :data:`aifs_modal.settings.IC_SOURCES`. Defaults to
         :data:`aifs_modal.settings.DEFAULT_IC_SOURCE`.  ICs already present in
-        the target repo are skipped.
+        the target volume are skipped.
     source_repo : str, optional
         ArrayLake repository name. Required when ``source="ifs-arraylake"``.
     source_branch : str, optional
         Branch in the ArrayLake source repository. Default ``"main"``.
+    keep_ics : bool, optional
+        If ``False`` (default), IC data is deleted from the Modal Volume after
+        successful inference. Set to ``True`` to retain ICs for reuse.
     n_members : int, optional
         If set, run an ensemble forecast with this many members. If ``None``,
         run a single deterministic forecast.
@@ -827,51 +767,29 @@ def run_forecast(
         sequentially on one GPU.
     """
     _require_outputs_target(outputs_repo, outputs_prefix)
-    source, initial_conditions_prefix = _resolve_ic(source, initial_conditions_prefix)
-    if not _ic_dates_present(
-        date,
-        storage_bucket,
-        initial_conditions_prefix=initial_conditions_prefix,
-        initial_conditions_branch=initial_conditions_branch,
-        storage_type=storage_type,
-    ):
+    if source is None:
+        source = settings.DEFAULT_IC_SOURCE
+
+    ic_volume.reload()
+    if not _ic_dates_present(date, settings.IC_DIR):
         start = (date - datetime.timedelta(hours=6)).isoformat()
         end = date.isoformat()
         if source == "era5-arco":
-            ingest_era5_arco.remote(
-                start,
-                end,
-                storage_bucket,
-                initial_conditions_prefix=initial_conditions_prefix,
-                initial_conditions_branch=initial_conditions_branch,
-                storage_type=storage_type,
-            )
+            ingest_era5_arco.remote(start, end)
         elif source == "ifs-arraylake":
             ingest_ifs_arraylake.remote(
                 start,
                 end,
-                storage_bucket,
                 source_repo=source_repo,
                 source_branch=source_branch,
                 source_static_branch=source_static_branch,
-                initial_conditions_prefix=initial_conditions_prefix,
-                initial_conditions_branch=initial_conditions_branch,
-                storage_type=storage_type,
             )
         else:
             fetch_fn = _make_fetch_fn(
                 source, source_repo=source_repo, source_branch=source_branch
             )
-            ic.ingest_range(
-                start,
-                end,
-                storage_bucket,
-                fetch_fn,
-                source=source,
-                initial_conditions_prefix=initial_conditions_prefix,
-                initial_conditions_branch=initial_conditions_branch,
-                storage_type=storage_type,
-            )
+            ic.ingest_range(start, end, settings.IC_DIR, fetch_fn, source=source)
+            ic_volume.commit()
 
     if n_members is None or not parallel_members:
         if checkpoint is None:
@@ -885,15 +803,13 @@ def run_forecast(
             storage_bucket,
             checkpoint,
             lead_time=lead_time,
-            initial_conditions_repo=initial_conditions_repo,
-            initial_conditions_prefix=initial_conditions_prefix,
-            initial_conditions_branch=initial_conditions_branch,
             outputs_repo=outputs_repo,
             outputs_prefix=outputs_prefix,
             outputs_branch=outputs_branch,
             n_members=n_members,
             include_pressure_levels=include_pressure_levels,
             overwrite=overwrite,
+            keep_ics=keep_ics,
             storage_type=storage_type,
         )
         return
@@ -966,16 +882,12 @@ def run_forecast(
     member_kwargs = dict(
         base_group=base_group,
         lead_time=lead_time,
-        initial_conditions_repo=initial_conditions_repo,
-        initial_conditions_prefix=initial_conditions_prefix,
-        initial_conditions_branch=initial_conditions_branch,
         checkpoint=checkpoint,
         include_pressure_levels=include_pressure_levels,
-        storage_type=storage_type,
     )
     print(f"spawning {n_members} ensemble members in parallel")
     handles = [
-        run_ensemble_member.spawn(m, date, storage_bucket, fork, **member_kwargs)
+        run_ensemble_member.spawn(m, date, fork, **member_kwargs)
         for m in range(n_members)
     ]
     returned_forks = [h.get() for h in handles]
@@ -984,12 +896,21 @@ def run_forecast(
     session.commit(f"ensemble forecast for {base_group} ({n_members} members)")
     print(f"ensemble forecast for {base_group} ({n_members} members) complete")
 
+    if not keep_ics:
+        ic_volume.reload()
+        ic.delete_ic_dates(date, settings.IC_DIR)
+        ic_volume.commit()
+
 
 @app.function(
     image=infer_image,
     gpu=settings.GPU_TYPE,
     timeout=60 * 60 * 4,
-    volumes={settings.DATA_DIR: data_volume, settings.MODELS_DIR: models_volume},
+    volumes={
+        settings.DATA_DIR: data_volume,
+        settings.MODELS_DIR: models_volume,
+        settings.IC_DIR: ic_volume,
+    },
     secrets=_secrets,
 )
 def run_inference(
@@ -998,15 +919,13 @@ def run_inference(
     checkpoint: dict,
     *,
     lead_time: int | None = None,
-    initial_conditions_repo: str | None = None,
-    initial_conditions_prefix: str | None = None,
-    initial_conditions_branch: str = "main",
     outputs_repo: str | None = None,
     outputs_prefix: str | None = None,
     outputs_branch: str = "main",
     n_members: int | None = None,
     include_pressure_levels: bool = False,
     overwrite: bool = False,
+    keep_ics: bool = False,
     storage_type: str = "tigris",
 ) -> None:
     """GPU primitive: deterministic or sequential ensemble AIFS forecast.
@@ -1022,10 +941,6 @@ def run_inference(
     from anemoi.inference.runners.simple import SimpleRunner
 
     _require_outputs_target(outputs_repo, outputs_prefix)
-    if initial_conditions_repo is None and initial_conditions_prefix is None:
-        raise ValueError(
-            "initial_conditions_prefix (or initial_conditions_repo) is required"
-        )
 
     outputs_repo_obj = _open_outputs_repo(
         storage_bucket,
@@ -1057,15 +972,9 @@ def run_inference(
         except zarr.errors.GroupNotFoundError:
             pass
 
-    ic_session = _load_initial_conditions(
-        storage_bucket,
-        initial_conditions_repo=initial_conditions_repo,
-        initial_conditions_prefix=initial_conditions_prefix,
-        initial_conditions_branch=initial_conditions_branch,
-        storage_type=storage_type,
-    )
+    ic_volume.reload()
     print("loading initial conditions for", date)
-    fields = ic.fetch_initial_conditions(date, ic_session)
+    fields = ic.fetch_initial_conditions(date, settings.IC_DIR)
     print("loading model checkpoint")
     runner = SimpleRunner(checkpoint, device="cuda")
     print("initializing regridder")
@@ -1113,3 +1022,7 @@ def run_inference(
     )
     outputs_session.commit(commit_msg)
     print(commit_msg)
+
+    if not keep_ics:
+        ic.delete_ic_dates(date, settings.IC_DIR)
+        ic_volume.commit()

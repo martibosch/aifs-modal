@@ -8,15 +8,6 @@ AIFS_ENS_CHECKPOINT = {"huggingface": "ecmwf/aifs-ens-1.0"}
 IC_SOURCES = ("ifs-arraylake", "ifs-ekd", "era5-cds", "era5-arco")
 DEFAULT_IC_SOURCE = "ifs-arraylake"
 
-# default storage prefix per source. Per-source so that two sources don't share
-# a repo (different IC content for the same date would silently mix).
-DEFAULT_IC_PREFIXES = {
-    "ifs-ekd": "aifs-ics-ifs",
-    "era5-cds": "aifs-ics-era5-cds",
-    "era5-arco": "aifs-ics-era5-arco",
-    "ifs-arraylake": "aifs-ics-ifs-arraylake",
-}
-
 # default forecast args
 LEAD_TIME = 96
 
@@ -24,6 +15,8 @@ LEAD_TIME = 96
 GPU_TYPE = "L40S"
 DATA_VOLUME_NAME = "aifs-data"
 MODELS_VOLUME_NAME = "aifs-models"
+IC_VOLUME_NAME = "aifs-ics"
 DATA_DIR = "/data"
 MODELS_DIR = "/models"
+IC_DIR = "/ic"
 APP_NAME = "aifs-modal"

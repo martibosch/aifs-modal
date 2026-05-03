@@ -1,22 +1,22 @@
 """Initial-conditions store: shared constants, fetch, and ingest helpers.
 
 All ingest backends produce ``dict[str, np.ndarray]`` for one date and hand it
-to :func:`get_and_store_date`, which writes a uniform zarr group into an
-icechunk session.  :func:`ingest_range` wraps the per-date loop, repo open,
-and commit so each backend module is just a variable map + ``get_all_data``.
+to :func:`get_and_store_date`, which writes a uniform zarr group under *ic_dir*.
+:func:`ingest_range` wraps the per-date loop so each backend module is just a
+variable map + ``get_all_data``.
 """
 
 import datetime
+import os
+import shutil
 from typing import Callable
 
 import earthkit.regrid as ekr
-import icechunk
 import numpy as np
 import zarr
 from earthkit.data import config
 
 from aifs_modal import utils
-from aifs_modal.utils import _STORAGE_TYPES
 
 config.set("cache-policy", "off")
 
@@ -71,110 +71,27 @@ def _store_data(group: zarr.Group, variable_names: list[str], data: np.ndarray):
 
 def get_and_store_date(
     date: datetime.datetime,
-    session: icechunk.Session,
+    ic_dir: str,
     fetch_fn: FetchFn,
-) -> icechunk.Session:
-    """Fetch one date with *fetch_fn* and write its zarr group into *session*."""
-    group = zarr.group(
-        store=session.store,
-        path=utils.datetime_to_str(date),
-        overwrite=True,
-    )
+) -> None:
+    """Fetch one date with *fetch_fn* and write its zarr group into *ic_dir*."""
+    date_path = os.path.join(ic_dir, utils.datetime_to_str(date))
+    group = zarr.open_group(date_path, mode="w", zarr_format=3)
     data_dict = fetch_fn(date)
     names, stacked = _stack_fields(data_dict)
     _store_data(group, names, stacked)
-    return session
-
-
-_SOURCE_ATTR = "aifs_ic_source"
-
-
-def _read_source_stamp(repo: icechunk.Repository, branch: str) -> str | None:
-    """Return the source label stamped on *repo*, or None if unstamped."""
-    try:
-        root = zarr.open_group(
-            repo.readonly_session(branch).store, mode="r", zarr_format=3
-        )
-    except zarr.errors.GroupNotFoundError:
-        return None
-    return root.attrs.get(_SOURCE_ATTR)
-
-
-def _ensure_source_stamp(repo: icechunk.Repository, branch: str, source: str) -> None:
-    """Stamp *repo* with *source* on first use; reject mismatched sources.
-
-    The stamp is a single attribute on the zarr root group, so different IC
-    sources cannot silently share a repo (different content for the same date
-    would otherwise mix).
-    """
-    existing = _read_source_stamp(repo, branch)
-    if existing is None:
-        ws = repo.writable_session(branch)
-        root = zarr.group(store=ws.store, zarr_format=3)
-        root.attrs[_SOURCE_ATTR] = source
-        ws.commit(f"aifs-modal: stamp IC repo source={source}")
-        return
-    if existing != source:
-        raise ValueError(
-            f"IC repo is stamped with source={existing!r}; refusing to write "
-            f"source={source!r}. Use a different initial_conditions_prefix."
-        )
-
-
-def ensure_date_ingested(
-    date: datetime.datetime,
-    repo: icechunk.Repository,
-    fetch_fn: FetchFn,
-    branch: str = "main",
-    *,
-    source: str,
-) -> None:
-    """Ensure initial conditions for *date* are committed to *repo*.
-
-    If the zarr group for *date* already exists, this is a no-op. Otherwise
-    *fetch_fn* is called to produce the data, which is stored and committed.
-    Repo is stamped with *source* on first use; mismatched sources are rejected.
-    """
-    _ensure_source_stamp(repo, branch, source)
-
-    group_name = utils.datetime_to_str(date)
-    readonly_session = repo.readonly_session(branch)
-    try:
-        zarr.open_group(
-            readonly_session.store, path=group_name, mode="r", zarr_format=3
-        )
-    except zarr.errors.GroupNotFoundError:
-        print(
-            f"Initial conditions missing for {date.isoformat()} "
-            f"(group: {group_name}); ingesting now"
-        )
-    else:
-        print(
-            f"Initial conditions already ingested for {date.isoformat()} "
-            f"(group: {group_name}); skipping"
-        )
-        return
-
-    writable_session = repo.writable_session(branch)
-    get_and_store_date(date, writable_session, fetch_fn)
-    commit_msg = f"Ingested initial conditions for {date.isoformat()}"
-    writable_session.commit(commit_msg)
-    print(commit_msg)
 
 
 def fetch_initial_conditions(
-    date: datetime.datetime, session: icechunk.Session
+    date: datetime.datetime, ic_dir: str
 ) -> dict[str, np.ndarray]:
-    """Fetch initial conditions for *date* (and *date*−6h) from an icechunk session."""
-    group_prev = zarr.open_group(
-        session.store,
-        zarr_format=3,
-        path=utils.datetime_to_str(date - datetime.timedelta(hours=6)),
-        mode="r",
+    """Fetch initial conditions for *date* (and *date*−6h) from *ic_dir*."""
+    prev_path = os.path.join(
+        ic_dir, utils.datetime_to_str(date - datetime.timedelta(hours=6))
     )
-    group_curr = zarr.open_group(
-        session.store, zarr_format=3, path=utils.datetime_to_str(date), mode="r"
-    )
+    curr_path = os.path.join(ic_dir, utils.datetime_to_str(date))
+    group_prev = zarr.open_group(prev_path, mode="r", zarr_format=3)
+    group_curr = zarr.open_group(curr_path, mode="r", zarr_format=3)
 
     vnames_curr = group_curr["variable"][:]
     vnames_prev = group_prev["variable"][:]
@@ -204,69 +121,44 @@ def fetch_initial_conditions(
     return fields
 
 
+def delete_ic_dates(date: datetime.datetime, ic_dir: str) -> None:
+    """Delete IC directories for *date* and *date*−6h from *ic_dir*."""
+    for d in [date - datetime.timedelta(hours=6), date]:
+        path = os.path.join(ic_dir, utils.datetime_to_str(d))
+        if os.path.exists(path):
+            shutil.rmtree(path)
+            print(f"deleted IC directory {path}")
+
+
 def ingest_range(
     start_date: str,
     end_date: str,
-    storage_bucket: str,
+    ic_dir: str,
     fetch_fn: FetchFn,
     *,
     source: str,
-    initial_conditions_prefix: str | None = None,
-    initial_conditions_branch: str = "main",
-    storage_type: str = "tigris",
 ) -> None:
-    """Loop over 6-hourly dates in [start, end], fetch each, commit at the end.
-
-    Parameters
-    ----------
-    fetch_fn : callable(date) -> dict[str, ndarray]
-        Source-specific fetcher returning one date's variables.
-    source : str
-        Canonical source label (one of :data:`settings.IC_SOURCES`). Used to
-        stamp the IC repo and reject mismatched future writes. Also used to
-        resolve the default ``initial_conditions_prefix``.
-    initial_conditions_prefix : str, optional
-        Defaults to :data:`settings.DEFAULT_IC_PREFIXES` ``[source]``.
-    """
-    from aifs_modal import settings
-
+    """Loop over 6-hourly dates in [start, end] and write each into *ic_dir*."""
     start = _parse_utc_date(start_date)
     end = _parse_utc_date(end_date)
     if end < start:
         raise ValueError(
             f"end_date must be >= start_date (got {start_date!r} -> {end_date!r})"
         )
-    if storage_type not in _STORAGE_TYPES:
-        raise ValueError(
-            f"Unknown storage_type: {storage_type!r}. "
-            f"Must be one of: {', '.join(_STORAGE_TYPES)}"
-        )
-    if initial_conditions_prefix is None:
-        initial_conditions_prefix = settings.DEFAULT_IC_PREFIXES[source]
 
-    storage = utils.get_storage(storage_bucket, initial_conditions_prefix, storage_type)
-    repo = icechunk.Repository.open_or_create(storage)
-    _ensure_source_stamp(repo, initial_conditions_branch, source)
-    session = repo.writable_session(initial_conditions_branch)
-
-    readonly_session = repo.readonly_session(initial_conditions_branch)
+    os.makedirs(ic_dir, exist_ok=True)
     dates = list(_iter_dates_6h(start, end))
     ingested_dates = []
     for i, date in enumerate(dates, start=1):
-        group_name = utils.datetime_to_str(date)
-        try:
-            zarr.open_group(
-                readonly_session.store, path=group_name, mode="r", zarr_format=3
-            )
-        except zarr.errors.GroupNotFoundError:
-            print(f"[{i}/{len(dates)}] ingesting {source} {date.isoformat()}")
-        else:
+        date_path = os.path.join(ic_dir, utils.datetime_to_str(date))
+        if os.path.exists(date_path):
             print(
                 f"[{i}/{len(dates)}] {source} already ingested for "
-                f"{date.isoformat()} (group: {group_name}); skipping"
+                f"{date.isoformat()}; skipping"
             )
             continue
-        get_and_store_date(date, session, fetch_fn)
+        print(f"[{i}/{len(dates)}] ingesting {source} {date.isoformat()}")
+        get_and_store_date(date, ic_dir, fetch_fn)
         ingested_dates.append(date)
 
     if not ingested_dates:
@@ -276,12 +168,10 @@ def ingest_range(
         )
         return
 
-    commit_msg = (
+    print(
         f"Wrote {source} initial conditions from {start.isoformat()} "
         f"to {end.isoformat()} ({len(ingested_dates)}/{len(dates)} new dates)"
     )
-    session.commit(commit_msg)
-    print(commit_msg)
 
 
 def _parse_utc_date(date_str: str) -> datetime.datetime:
