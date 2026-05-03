@@ -273,28 +273,32 @@ def _require_outputs_target(
         )
 
 
-def _ensure_ic_for_forecast(
+def _ic_dates_present(
     date: datetime.datetime,
     storage_bucket: str,
     *,
-    source: str,
     initial_conditions_prefix: str,
     initial_conditions_branch: str,
     storage_type: str,
-    source_repo: str | None = None,
-    source_branch: str = "main",
-) -> None:
-    """Ensure IC for *date* and *date−6h* are committed, ingesting if absent."""
-    fetch_fn = _make_fetch_fn(
-        source, source_repo=source_repo, source_branch=source_branch
-    )
-    ic_repo = icechunk.Repository.open_or_create(
-        utils.get_storage(storage_bucket, initial_conditions_prefix, storage_type)
-    )
+) -> bool:
+    """Return True if ICs for *date* and *date−6h* are already committed."""
+    storage = utils.get_storage(storage_bucket, initial_conditions_prefix, storage_type)
+    try:
+        repo = icechunk.Repository.open(storage)
+    except Exception:
+        return False
+    session = repo.readonly_session(initial_conditions_branch)
     for ic_date in [date - datetime.timedelta(hours=6), date]:
-        ic.ensure_date_ingested(
-            ic_date, ic_repo, fetch_fn, initial_conditions_branch, source=source
-        )
+        try:
+            zarr.open_group(
+                session.store,
+                path=utils.datetime_to_str(ic_date),
+                mode="r",
+                zarr_format=3,
+            )
+        except zarr.errors.GroupNotFoundError:
+            return False
+    return True
 
 
 def _open_outputs_repo(
@@ -819,16 +823,50 @@ def run_forecast(
     """
     _require_outputs_target(outputs_repo, outputs_prefix)
     source, initial_conditions_prefix = _resolve_ic(source, initial_conditions_prefix)
-    _ensure_ic_for_forecast(
+    if not _ic_dates_present(
         date,
         storage_bucket,
-        source=source,
         initial_conditions_prefix=initial_conditions_prefix,
         initial_conditions_branch=initial_conditions_branch,
         storage_type=storage_type,
-        source_repo=source_repo,
-        source_branch=source_branch,
-    )
+    ):
+        start = (date - datetime.timedelta(hours=6)).isoformat()
+        end = date.isoformat()
+        if source == "era5-arco":
+            ingest_era5_arco.remote(
+                start,
+                end,
+                storage_bucket,
+                initial_conditions_prefix=initial_conditions_prefix,
+                initial_conditions_branch=initial_conditions_branch,
+                storage_type=storage_type,
+            )
+        elif source == "ifs-arraylake":
+            ingest_ifs_arraylake.remote(
+                start,
+                end,
+                storage_bucket,
+                source_repo=source_repo,
+                source_branch=source_branch,
+                source_static_branch=source_static_branch,
+                initial_conditions_prefix=initial_conditions_prefix,
+                initial_conditions_branch=initial_conditions_branch,
+                storage_type=storage_type,
+            )
+        else:
+            fetch_fn = _make_fetch_fn(
+                source, source_repo=source_repo, source_branch=source_branch
+            )
+            ic.ingest_range(
+                start,
+                end,
+                storage_bucket,
+                fetch_fn,
+                source=source,
+                initial_conditions_prefix=initial_conditions_prefix,
+                initial_conditions_branch=initial_conditions_branch,
+                storage_type=storage_type,
+            )
 
     if n_members is None or not parallel_members:
         if checkpoint is None:
