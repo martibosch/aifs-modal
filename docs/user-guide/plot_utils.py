@@ -66,7 +66,7 @@ def make_cartopy_plot(
 
 def make_cartopy_facet_plot(
     da: xr.DataArray,
-    col: str = "valid_time",
+    col: str = "lead_time",
     *,
     projection: ccrs.Projection | None = None,
     cmap: str = "viridis",
@@ -82,7 +82,7 @@ def make_cartopy_facet_plot(
     da : xr.DataArray
         Data to plot. It must contain the provided `facet_coord`, plus `lat` and `lon`.
     col : str, optional
-        Coordinate/dimension used for faceting. Defaults to "valid_time".
+        Coordinate/dimension used for faceting. Defaults to "lead_time".
     projection : ccrs.Projection | None, optional
         Cartopy projection for each facet. Defaults to ``ccrs.PlateCarree()``.
     cmap : str, optional

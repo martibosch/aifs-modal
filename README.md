@@ -7,13 +7,13 @@
 
 # AIFS on Modal
 
-`aifs-modal` is a Python library for running *serverless* [AIFS](https://www.ecmwf.int/en/forecasts/documentation-and-support/aifs) weather forecasts on [Modal](https://modal.com). Only the AIFS inference step runs on a Modal GPU: initial conditions ingestion, post-processing, and visualization all run locally without a GPU. Forecast outputs are stored in [Icechunk](https://icechunk.io) repositories on S3-compatible object storage (or [Earthmover ArrayLake](https://earthmover.io)), giving them a git-like version history you can open with xarray from anywhere.
+`aifs-modal` is a Python library for running *serverless* [AIFS](https://www.ecmwf.int/en/forecasts/documentation-and-support/aifs) weather forecasts on [Modal](https://modal.com). Only AIFS inference runs on a Modal GPU; initial-conditions ingestion is dispatched to co-located Modal CPU workers and cached on a Modal Volume. Forecast outputs are stored in [Icechunk](https://icechunk.io) repositories on S3-compatible object storage (or [Earthmover ArrayLake](https://earthmover.io)), giving them a git-like version history you can open with xarray from anywhere.
 
 ## Features
 
 - **Three forecast modes**: deterministic (AIFS-Single), sequential ensemble (AIFS-ENS, one GPU), and parallel ensemble (one GPU per member using cooperative distributed writes).
 - **Versioned array storage via [Icechunk](https://icechunk.io)**: forecast outputs are stored with git-like branching and commit history, so you can reproduce any past run and safely extend ensemble experiments. All [storage backends supported by Icechunk](https://icechunk.io/en/stable/storage/) are available (Tigris, AWS S3, Cloudflare R2, Google Cloud Storage, Azure Blob Storage, Earthmover ArrayLake).
-- **Task-based pipeline**: the ingestion of initial conditions and forecast inference are framed as steps of a computational pipeline, so they are skipped if its outputs already exist. Therefore, *re-running a notebook cell never duplicates work or wastes GPU resources*.
+- **Task-based pipeline**: ingestion and inference are framed as pipeline steps, skipped when outputs already exist. Re-running a notebook cell never duplicates work or wastes GPU resources.
 - **Reproducible ensembles**: each member is seeded by its index (`torch.manual_seed(member_id)`), so you can safely extend an ensemble run later by increasing `n_members`.
 
 ![AIFS-Single 96-hour forecast over Europe](https://raw.githubusercontent.com/martibosch/aifs-modal/main/docs/figures/forecast-europe.png)
@@ -22,74 +22,55 @@
 ![AIFS-ENS ensemble forecast for Lausanne](https://raw.githubusercontent.com/martibosch/aifs-modal/main/docs/figures/ensemble-forecast-lausanne.png)
 *AIFS-ENS 10-member ensemble forecast of 2-meter temperature for Lausanne, verified against MeteoSwiss station data.*
 
+## Why aifs-modal?
+
+Two publicly accessible AIFS archives already exist: the [ECMWF operational archive](https://www.ecmwf.int/en/forecasts/dataset/operational-archive) and [dynamical.org](https://dynamical.org/catalog/ecmwf-aifs-single-forecast/). `aifs-modal` fills the gap for cases they don't cover:
+
+1. **Extended lead times** — operational forecasts top out at 10–15 days; `aifs-modal` runs to any lead time. See the [jet-stream free-run notebook](https://aifs-modal.readthedocs.io/en/latest/user-guide/jet-stream-free-run.html): a 105-day NH jet-stream tracking run from ERA5 initial conditions.
+
+2. **Retrospective reforecasts from ERA5** — ERA5 spans 80+ years of reanalysis, enabling ensemble reforecasts for any past date regardless of operational archive retention. See the [heatwave reforecast notebook](https://aifs-modal.readthedocs.io/en/latest/user-guide/heatwave-reforecast-ens.html): a 10-member AIFS-ENS reforecast of the June 2025 European heatwave verified against station observations.
+
+3. **Custom initial conditions** — ingestion and inference are decoupled, so any field array following the AIFS variable convention can serve as initial conditions. Applications include perturbed or bias-corrected states from climate-model scenarios. See the [CMIP6 SST-patch notebook](https://aifs-modal.readthedocs.io/en/latest/user-guide/cmip6-sst-patch.html): patching ERA5 sea-surface temperatures to mimic a warmer-climate storyline before running the forecast.
+
 ## Usage
+
+Before running, complete the [setup steps](https://aifs-modal.readthedocs.io/en/latest/user-guide/index.html) (Modal account, storage bucket, IC-source credentials, and `pip install aifs-modal`). Then a forecast runs in a few lines:
 
 ```python
 import datetime
-
-import icechunk
 import xarray as xr
-
-from aifs_modal._app import app, run_forecast
-from aifs_modal import ingest
+from aifs_modal import app, run_forecast
 
 date = datetime.datetime(2025, 6, 20, 0, tzinfo=datetime.UTC)
-storage_bucket = "my-bucket"
 
-# 1. Ingest initial conditions from ECMWF Open Data (local, CPU)
-ingest.ingest(
-    date.isoformat(),
-    date.isoformat(),
-    storage_bucket,
-    initial_conditions_prefix="aifs-ics",
-)
-
-# 2. Run a 96-hour forecast on Modal (GPU, ~$0.05)
+# 1. Run a 96-hour forecast on Modal — ICs are ingested automatically (~$0.05 GPU cost)
 with app.run():
     run_forecast.remote(
         date,
-        storage_bucket,
-        initial_conditions_prefix="aifs-ics",
+        storage_bucket="my-tigris-bucket",
+        source_repo="org/ecmwf-ifs-hres-ics-open",  # Brightband IFS dataset
         outputs_prefix="aifs-outputs",
         lead_time=96,
     )
 
-# 3. Open the results locally with xarray
-repo = icechunk.Repository.open(...)
+# 2. Open the results locally with xarray — no GPU needed
+import icechunk
+repo = icechunk.Repository.open(
+    icechunk.tigris_storage(bucket="my-tigris-bucket", prefix="aifs-outputs", ...)
+)
 ds = xr.open_dataset(
     repo.readonly_session("main").store,
     group="2025-06-20/00z",
     engine="zarr",
     zarr_format=3,
 )
-ds
 ```
 
-```
-<xarray.Dataset>
-Dimensions:     (valid_time: 16, lat: 721, lon: 1440)
-Coordinates:
-  * valid_time  (valid_time) datetime64[ns] 2025-06-20T06:00:00 ... 2025-06-24T00:00:00
-  * lat         (lat) float64 90.0 89.75 89.5 ... -89.75 -90.0
-  * lon         (lon) float64 0.0 0.25 0.5 ... 359.5 359.75
-Data variables:
-    10u         (valid_time, lat, lon) float32 ...
-    10v         (valid_time, lat, lon) float32 ...
-    2d          (valid_time, lat, lon) float32 ...
-    2t          (valid_time, lat, lon) float32 ...
-    msl         (valid_time, lat, lon) float32 ...
-    skt         (valid_time, lat, lon) float32 ...
-    sp          (valid_time, lat, lon) float32 ...
-    tcw         (valid_time, lat, lon) float32 ...
-    ...
-```
-
-See the [user guide](https://aifs-modal.readthedocs.io) for more example applications (heatwave reforecasting, jet-stream free runs).
+See the [user guide](https://aifs-modal.readthedocs.io/en/latest/user-guide/your-first-forecast.html) for a full worked example including ensemble forecasts and output visualization.
 
 ## Requirements
 
-1. A [Modal](https://modal.com) account. The Starter plan gives you [$30/month in free credits](https://modal.com/pricing) — a 96-hour forecast costs roughly $0.05, so that's about 600 forecasts for free.
-2. An object-storage bucket for Icechunk outputs. [Tigris](https://www.tigrisdata.com) is the recommended default: the [free tier](https://www.tigrisdata.com/pricing) includes 5 GB/month.
+A Modal account, an S3-compatible storage bucket, and credentials for your chosen initial-conditions source. See the [setup guide](https://aifs-modal.readthedocs.io/en/latest/user-guide/index.html) for step-by-step instructions.
 
 ## Installation
 

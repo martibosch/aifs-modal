@@ -167,6 +167,9 @@ known-first-party = [
 "tests/test_aifs_modal.py" = [
   "D"
 ]
+"docs/user-guide/*.ipynb" = [
+  "D"
+]
 
 [tool.ruff.lint.pydocstyle]
 convention = "numpy"
