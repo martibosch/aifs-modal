@@ -18,6 +18,7 @@ to their dedicated co-located functions (``ingest_era5_arco``,
 import contextlib
 import datetime
 import os
+import time
 from os import path
 
 import earthkit.regrid as ekr
@@ -140,6 +141,8 @@ LAT = 90 - 0.25 * np.arange(721)
 LON = 0.25 * np.arange(1440)
 PRESSURE_LEVELS = [50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000]
 PRESSURE_VAR_PREFIXES = ("q", "t", "u", "v", "w", "z")
+ENSEMBLE_MEMBER_POLL_SECONDS = 60.0
+ENSEMBLE_MEMBER_COLLECTION_TIMEOUT_SECONDS = 60 * 60 * 5
 
 
 # ---------------------------------------------------------------------------
@@ -457,6 +460,80 @@ def _drop_regionless_coords(ds: xr.Dataset, region_dim: str) -> xr.Dataset:
     return ds.drop_vars(coord_names)
 
 
+def _ensemble_output_complete(ds: xr.Dataset, n_members: int) -> bool:
+    """Return whether an ensemble output group was fully committed."""
+    return (
+        ds.attrs.get("aifs_modal_status") == "complete"
+        and ds.sizes.get("ensemble_member", 0) >= n_members
+    )
+
+
+def _cancel_pending_member_handles(handles_by_member: dict[int, object]) -> None:
+    """Best-effort cancellation for member calls still owned by the orchestrator."""
+    for member_id, handle in handles_by_member.items():
+        cancel = getattr(handle, "cancel", None)
+        if not callable(cancel):
+            continue
+        try:
+            cancel(terminate_containers=True)
+        except TypeError:
+            cancel()
+        except Exception as exc:
+            print(f"member {member_id}: failed to cancel pending call: {exc!r}")
+
+
+def _collect_member_forks(
+    handles: list[object],
+    *,
+    poll_interval: float = ENSEMBLE_MEMBER_POLL_SECONDS,
+    timeout: float = ENSEMBLE_MEMBER_COLLECTION_TIMEOUT_SECONDS,
+    clock=time.monotonic,
+    sleep=time.sleep,
+) -> list[object]:
+    """Poll spawned member calls and return forks in member order."""
+    started = clock()
+    next_log = started
+    pending = dict(enumerate(handles))
+    returned: dict[int, object] = {}
+
+    while pending:
+        for member_id, handle in list(pending.items()):
+            try:
+                returned[member_id] = handle.get(timeout=0)
+            except TimeoutError:
+                continue
+            except Exception as exc:
+                _cancel_pending_member_handles(pending)
+                raise RuntimeError(f"ensemble member {member_id} failed") from exc
+            else:
+                del pending[member_id]
+                print(f"member {member_id}: returned fork")
+
+        if not pending:
+            break
+
+        now = clock()
+        elapsed = now - started
+        if elapsed > timeout:
+            pending_members = sorted(pending)
+            _cancel_pending_member_handles(pending)
+            raise TimeoutError(
+                "timed out waiting for ensemble member forks after "
+                f"{elapsed:.0f}s; pending members: {pending_members}"
+            )
+
+        if now >= next_log:
+            print(
+                f"waiting for {len(pending)} ensemble member(s) to return forks: "
+                f"{sorted(pending)} ({elapsed:.0f}s elapsed)"
+            )
+            next_log = now + poll_interval
+
+        sleep(min(poll_interval, max(0.0, timeout - elapsed)))
+
+    return [returned[i] for i in range(len(handles))]
+
+
 def _as_str_list(val) -> list[str] | None:
     """Coerce ``val`` into a list of variable-name strings, or None.
 
@@ -623,7 +700,11 @@ def _empty_ensemble_template(
             pressure_dims,
             da.empty(pressure_shape, chunks=pressure_chunks, dtype="f4"),
         )
-    return xr.Dataset(data_vars, coords=coords)
+    ds = xr.Dataset(data_vars, coords=coords)
+    ds.attrs["aifs_modal_status"] = "initialized"
+    ds.attrs["n_members"] = n_members
+    ds.attrs["lead_time_hours"] = lead_time
+    return ds
 
 
 def _chunk_member_ds(ds: xr.Dataset, *, n_steps: int) -> xr.Dataset:
@@ -648,6 +729,7 @@ def _chunk_member_ds(ds: xr.Dataset, *, n_steps: int) -> xr.Dataset:
     image=infer_image,
     gpu=settings.GPU_TYPE,
     timeout=60 * 60 * 4,
+    retries=2,
     volumes={settings.MODELS_DIR: models_volume, settings.IC_DIR: ic_volume},
     secrets=_secrets,
 )
@@ -692,6 +774,7 @@ def run_ensemble_member(
     ds = _chunk_member_ds(ds, n_steps=lead_time // 6)
     ds = _drop_regionless_coords(ds, "ensemble_member")
 
+    print(f"member {member_id}: writing region")
     ds.to_zarr(
         fork.store,
         group=base_group,
@@ -700,6 +783,7 @@ def run_ensemble_member(
         region={"ensemble_member": slice(member_id, member_id + 1)},
     )
     print(f"member {member_id}: wrote region")
+    print(f"member {member_id}: returning fork")
     return fork
 
 
@@ -836,12 +920,17 @@ def run_forecast(
                 zarr_format=3,
                 chunks=None,
             )
-            if existing.sizes.get("ensemble_member", 0) >= n_members:
+            if _ensemble_output_complete(existing, n_members):
                 print(
                     f"Ensemble forecast already complete for {date.isoformat()} "
                     f"({n_members} members); skipping"
                 )
                 return
+            if existing.sizes.get("ensemble_member", 0) >= n_members:
+                print(
+                    f"Existing ensemble output for {date.isoformat()} has "
+                    f"status={existing.attrs.get('aifs_modal_status')!r}; rerunning"
+                )
         except Exception:
             pass
 
@@ -890,9 +979,21 @@ def run_forecast(
         run_ensemble_member.spawn(m, date, fork, **member_kwargs)
         for m in range(n_members)
     ]
-    returned_forks = [h.get() for h in handles]
+    returned_forks = _collect_member_forks(handles)
+    print(f"all {n_members} ensemble members returned forks")
 
+    print(f"merging {len(returned_forks)} member forks")
     session.merge(*returned_forks)
+    print("merged member forks")
+    group = zarr.open_group(
+        session.store,
+        path=base_group,
+        mode="a",
+        zarr_format=3,
+    )
+    group.attrs["aifs_modal_status"] = "complete"
+    group.attrs["n_members"] = n_members
+    group.attrs["lead_time_hours"] = lead_time
     session.commit(f"ensemble forecast for {base_group} ({n_members} members)")
     print(f"ensemble forecast for {base_group} ({n_members} members) complete")
 
