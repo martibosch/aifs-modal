@@ -96,6 +96,7 @@ ingest_image = (
     )
 )
 
+
 flash_attn_release = (
     "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/"
     "flash_attn-2.8.3+cu12torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
@@ -128,6 +129,7 @@ infer_image = (
             "TORCH_HOME": path.join(settings.MODELS_DIR, "torch"),
             "PYTORCH_ALLOC_CONF": "expandable_segments:True",
             "ANEMOI_INFERENCE_NUM_CHUNKS": "16",
+            **settings.INFER_IMAGE_ZARR_ENV,
         }
     )
 )

@@ -11,6 +11,9 @@ DEFAULT_IC_SOURCE = "ifs-arraylake"
 # default forecast args
 LEAD_TIME = 96
 
+# zarr env config overrides for inference image
+INFER_IMAGE_ZARR_ENV = {"ZARR__ASYNC__CONCURRENCY": "4"}
+
 # modal app config
 GPU_TYPE = "L40S"
 DATA_VOLUME_NAME = "aifs-data"
