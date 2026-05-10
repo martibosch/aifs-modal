@@ -730,7 +730,7 @@ def _chunk_member_ds(ds: xr.Dataset, *, n_steps: int) -> xr.Dataset:
     image=infer_image,
     gpu=settings.GPU_TYPE,
     timeout=60 * 60 * 4,
-    retries=2,
+    retries=3,
     volumes={settings.MODELS_DIR: models_volume, settings.IC_DIR: ic_volume},
     secrets=_secrets,
 )
