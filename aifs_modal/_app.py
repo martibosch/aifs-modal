@@ -19,6 +19,7 @@ import concurrent.futures
 import contextlib
 import datetime
 import os
+import random
 import time
 from os import path
 
@@ -773,6 +774,11 @@ def run_ensemble_member(
     )
     ds = _chunk_member_ds(ds, n_steps=lead_time // 6)
     ds = _drop_regionless_coords(ds, "ensemble_member")
+
+    jitter = random.uniform(0, settings.ENSEMBLE_MEMBER_WRITE_JITTER_SECONDS)
+    if jitter > 0:
+        print(f"member {member_id}: jittering write by {jitter:.1f}s")
+        time.sleep(jitter)
 
     print(f"member {member_id}: writing region")
     ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)

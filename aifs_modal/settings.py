@@ -15,6 +15,9 @@ LEAD_TIME = 96
 ENSEMBLE_MEMBER_POLL_SECONDS = 60.0
 ENSEMBLE_MEMBER_COLLECTION_TIMEOUT_SECONDS = 60 * 60 * 5
 ENSEMBLE_MEMBER_WRITE_TIMEOUT_SECONDS = 60  # or maybe 90
+# jitter fork writes by uniform[0, this] seconds, to avoid all members
+# hammering icechunk/S3 at the same instant
+ENSEMBLE_MEMBER_WRITE_JITTER_SECONDS = 30.0
 
 # zarr env config overrides for inference image
 INFER_IMAGE_ZARR_ENV = {"ZARR__ASYNC__CONCURRENCY": "4"}
