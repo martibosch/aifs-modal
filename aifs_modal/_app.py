@@ -15,6 +15,7 @@ to their dedicated co-located functions (``ingest_era5_arco``,
 ``ingest_ifs_arraylake``).
 """
 
+import concurrent.futures
 import contextlib
 import datetime
 import os
@@ -143,9 +144,6 @@ LAT = 90 - 0.25 * np.arange(721)
 LON = 0.25 * np.arange(1440)
 PRESSURE_LEVELS = [50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000]
 PRESSURE_VAR_PREFIXES = ("q", "t", "u", "v", "w", "z")
-ENSEMBLE_MEMBER_POLL_SECONDS = 60.0
-ENSEMBLE_MEMBER_COLLECTION_TIMEOUT_SECONDS = 60 * 60 * 5
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -487,8 +485,8 @@ def _cancel_pending_member_handles(handles_by_member: dict[int, object]) -> None
 def _collect_member_forks(
     handles: list[object],
     *,
-    poll_interval: float = ENSEMBLE_MEMBER_POLL_SECONDS,
-    timeout: float = ENSEMBLE_MEMBER_COLLECTION_TIMEOUT_SECONDS,
+    poll_interval: float = settings.ENSEMBLE_MEMBER_POLL_SECONDS,
+    timeout: float = settings.ENSEMBLE_MEMBER_COLLECTION_TIMEOUT_SECONDS,
     clock=time.monotonic,
     sleep=time.sleep,
 ) -> list[object]:
@@ -777,13 +775,25 @@ def run_ensemble_member(
     ds = _drop_regionless_coords(ds, "ensemble_member")
 
     print(f"member {member_id}: writing region")
-    ds.to_zarr(
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    fut = ex.submit(
+        ds.to_zarr,
         fork.store,
         group=base_group,
         zarr_format=3,
         consolidated=False,
         region={"ensemble_member": slice(member_id, member_id + 1)},
     )
+    done, _ = concurrent.futures.wait(
+        [fut], timeout=settings.ENSEMBLE_MEMBER_WRITE_TIMEOUT_SECONDS
+    )
+    ex.shutdown(wait=False)
+    if not done:
+        raise TimeoutError(
+            f"member {member_id}: zarr write timed out after "
+            f"{settings.ENSEMBLE_MEMBER_WRITE_TIMEOUT_SECONDS}s"
+        )
+    fut.result()
     print(f"member {member_id}: wrote region")
     print(f"member {member_id}: returning fork")
     return fork
