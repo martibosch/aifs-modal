@@ -87,5 +87,4 @@ cmip6-sst-patch
 a01-data
 a02-seq-vs-parallel-ens
 a03-ingestion-benchmark
-forecast-pipelines
 ```

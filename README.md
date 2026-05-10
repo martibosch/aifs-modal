@@ -16,21 +16,21 @@
 - **Task-based pipeline**: ingestion and inference are framed as pipeline steps, skipped when outputs already exist. Re-running a notebook cell never duplicates work or wastes GPU resources.
 - **Reproducible ensembles**: each member is seeded by its index (`torch.manual_seed(member_id)`), so you can safely extend an ensemble run later by increasing `n_members`.
 
+## Why aifs-modal?
+
+Two publicly accessible AIFS archives already exist: the [ECMWF operational archive](https://www.ecmwf.int/en/forecasts/dataset/operational-archive) and [dynamical.org](https://dynamical.org/catalog/ecmwf-aifs-single-forecast/). The key aim of `aifs-modal` is to fill the gaps for cases not covered by the archives:
+
+1. **Extended lead times**: operational forecasts top out at 10–15 days, whereas `aifs-modal` runs to any lead time. See the [jet-stream free-run notebook](https://aifs-modal.readthedocs.io/en/latest/user-guide/jet-stream-free-run.html) for a 105-day forecast to explore NH jet-stream comparison with ERA5 climatology.
+
+2. **Retrospective reforecasts from ERA5**: ERA5 spans 80+ years of reanalysis, enabling ensemble reforecasts for any past date regardless of operational archive retention. See the [heatwave reforecast notebook](https://aifs-modal.readthedocs.io/en/latest/user-guide/heatwave-reforecast-ens.html) for a 10-member AIFS-ENS reforecast of the June 2025 European heatwave verified against station observations.
+
+3. **Custom initial conditions**: ingestion and inference are decoupled, so any field array following the AIFS variable convention can serve as initial conditions. Applications include perturbed or bias-corrected states from climate-model scenarios. See the [CMIP6 SST-patch notebook](https://aifs-modal.readthedocs.io/en/latest/user-guide/cmip6-sst-patch.html) for an example patching ERA5 sea-surface temperatures to mimic a warmer-climate storyline before running the forecast.
+
 ![AIFS-Single 96-hour forecast over Europe](https://raw.githubusercontent.com/martibosch/aifs-modal/main/docs/figures/forecast-europe.png)
 *AIFS-Single deterministic 96-hour forecast of 2-meter temperature over Europe.*
 
 ![AIFS-ENS ensemble forecast for Lausanne](https://raw.githubusercontent.com/martibosch/aifs-modal/main/docs/figures/ensemble-forecast-lausanne.png)
 *AIFS-ENS 10-member ensemble forecast of 2-meter temperature for Lausanne, verified against MeteoSwiss station data.*
-
-## Why aifs-modal?
-
-Two publicly accessible AIFS archives already exist: the [ECMWF operational archive](https://www.ecmwf.int/en/forecasts/dataset/operational-archive) and [dynamical.org](https://dynamical.org/catalog/ecmwf-aifs-single-forecast/). `aifs-modal` fills the gap for cases they don't cover:
-
-1. **Extended lead times** — operational forecasts top out at 10–15 days; `aifs-modal` runs to any lead time. See the [jet-stream free-run notebook](https://aifs-modal.readthedocs.io/en/latest/user-guide/jet-stream-free-run.html): a 105-day NH jet-stream tracking run from ERA5 initial conditions.
-
-2. **Retrospective reforecasts from ERA5** — ERA5 spans 80+ years of reanalysis, enabling ensemble reforecasts for any past date regardless of operational archive retention. See the [heatwave reforecast notebook](https://aifs-modal.readthedocs.io/en/latest/user-guide/heatwave-reforecast-ens.html): a 10-member AIFS-ENS reforecast of the June 2025 European heatwave verified against station observations.
-
-3. **Custom initial conditions** — ingestion and inference are decoupled, so any field array following the AIFS variable convention can serve as initial conditions. Applications include perturbed or bias-corrected states from climate-model scenarios. See the [CMIP6 SST-patch notebook](https://aifs-modal.readthedocs.io/en/latest/user-guide/cmip6-sst-patch.html): patching ERA5 sea-surface temperatures to mimic a warmer-climate storyline before running the forecast.
 
 ## Usage
 

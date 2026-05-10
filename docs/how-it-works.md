@@ -12,62 +12,57 @@ Note that this set up is not intended for running an operational AIFS forecastin
 - **Initial conditions**: analysis fields ingested from an IC source (Brightband, ARCO-ERA5, or ECMWF open data), regridded to the N320 reduced Gaussian grid and written to a shared Modal IC Volume. AIFS requires two consecutive 6-hourly analyses (t−6h and t) as input. The Volume is a temporary per-run cache; ICs are deleted after successful inference unless `keep_ics=True`.
 - **IC sources**: four sources are supported — `ifs-arraylake` (default, Brightband ECMWF IFS on Earthmover ArrayLake, co-located in `us-east`), `era5-arco` (ARCO-ERA5 on GCS, co-located in `us-central1`), `ifs-ekd` (ECMWF open-data S3), and `era5-cds` (Copernicus CDS).
 
+The diagrams below use a consistent four-zone color scheme:
+
+| Zone           | Color  | Description                                    |
+| -------------- | ------ | ---------------------------------------------- |
+| Local          | grey   | Notebook or script on your machine             |
+| Modal CPU      | blue   | Orchestration and IC ingestion on Modal        |
+| Modal GPU      | orange | AIFS inference on Modal                        |
+| Object storage | green  | IC source and Icechunk output repository on S3 |
+
 ## Deterministic forecast (`run_forecast`)
 
 A single AIFS-Single run on one GPU. `run_forecast` is a Modal CPU function that acts as the orchestrator: it checks whether ICs are already on the IC Volume, dispatches ingestion to a co-located Modal CPU worker if they are missing, and then dispatches inference to a GPU container.
 
 ```{mermaid}
-flowchart TB
-    subgraph local ["Local (CPU)"]
-        A[Configure forecast<br/>date, source_repo, storage_bucket]
-        J[Read outputs & postprocess]
+flowchart LR
+    subgraph local ["Local"]
+        A["configure\nrun_forecast.remote()"]
+        J[read outputs]
     end
-
-    subgraph modal_orch ["Modal — run_forecast (CPU orchestrator)"]
-        B[ICs on IC Volume?]
-        C[dispatch ingest]
-        F[run_inference.remote]
+    subgraph modal_cpu ["Modal — CPU"]
+        B["orchestrate\n+ ingest ICs → Volume"]
     end
-
-    subgraph modal_ingest ["Modal — ingest (CPU, co-located)"]
-        G[Fetch from IC source<br/>Brightband / ARCO-ERA5 / …]
-        H[Write N320 ICs to IC Volume]
+    subgraph modal_gpu ["Modal — GPU"]
+        G["AIFS-Single\ninference"]
     end
-
-    subgraph modal_gpu ["Modal — run_inference (GPU) 🔥"]
-        I[Load ICs from IC Volume]
-        K[Run AIFS-Single<br/>regrid + stream → Icechunk]
+    subgraph storage ["Object storage"]
+        IC[("IC source")]
+        OUT[("Icechunk outputs")]
     end
-
-    subgraph storage ["Storage"]
-        VOL[(Modal IC Volume<br/>ephemeral)]
-        OUT[(Icechunk — outputs<br/>S3 / ArrayLake)]
-    end
-
     A --> B
-    B -- "missing" --> C --> G --> H --> VOL
-    H --> F
-    B -- "present" --> F
-    F --> I
-    VOL --> I
-    I --> K --> OUT --> J
+    IC --> B
+    B --> G
+    G --> OUT
+    OUT --> J
 
-    style modal_orch fill:#555,stroke:#333,color:#fff
-    style B fill:#777,stroke:#333,color:#fff
-    style C fill:#777,stroke:#333,color:#fff
-    style F fill:#777,stroke:#333,color:#fff
-    style modal_ingest fill:#4a90d9,stroke:#2c6fad,color:#fff
-    style G fill:#6aaae0,stroke:#2c6fad,color:#fff
-    style H fill:#6aaae0,stroke:#2c6fad,color:#fff
-    style modal_gpu fill:#ff6b35,stroke:#c44d1a,color:#fff
-    style I fill:#ff8c5a,stroke:#c44d1a,color:#fff
-    style K fill:#ff8c5a,stroke:#c44d1a,color:#fff
+    style local fill:#555,stroke:#333,color:#fff
+    style A fill:#777,stroke:#555,color:#fff
+    style J fill:#777,stroke:#555,color:#fff
+    style modal_cpu fill:#2c6fad,stroke:#1a4a7a,color:#fff
+    style B fill:#4a90d9,stroke:#2c6fad,color:#fff
+    style modal_gpu fill:#c44d1a,stroke:#8c3210,color:#fff
+    style G fill:#ff6b35,stroke:#c44d1a,color:#fff
+    style storage fill:#1a5c3a,stroke:#0d3d26,color:#fff
+    style IC fill:#2e7d52,stroke:#1a5c3a,color:#fff
+    style OUT fill:#2e7d52,stroke:#1a5c3a,color:#fff
 ```
 
 **Flow:**
 
 1. **Orchestrate** (Modal CPU, `run_forecast`): check the IC Volume for the target date. If ICs are missing, dispatch `ingest_ifs_arraylake` (Modal `us-east`) or `ingest_era5_arco` (Modal `us-central1`) and wait for completion; inline sources (`ifs-ekd`, `era5-cds`) run directly inside the orchestrator. Skipped if ICs are already present.
-2. **Ingest** (Modal CPU, co-located): download and regrid the IC fields to N320; commit them to the IC Volume.
+2. **Ingest** (Modal CPU, co-located): download and regrid the IC fields to N320; write them to the IC Volume.
 3. **Inference** (Modal GPU, `run_inference`): load initial conditions from the IC Volume, run the AIFS model, regrid output fields from N320 to 0.25° lat/lon, and stream each 6-hourly step to the outputs Icechunk repository.
 4. **Post-process** (local, CPU): open the outputs repository with xarray and analyze them.
 
@@ -76,57 +71,37 @@ flowchart TB
 Runs multiple AIFS-ENS members one after another on a single GPU. Each member uses a different random seed for stochastic perturbations. Ingestion and orchestration are identical to the deterministic case; the difference is that `run_inference` loops over members on the same GPU.
 
 ```{mermaid}
-flowchart TB
-    subgraph local ["Local (CPU)"]
-        A[Configure forecast<br/>date, n_members, source_repo]
-        J[Read outputs & postprocess]
+flowchart LR
+    subgraph local ["Local"]
+        A["configure\nrun_forecast.remote(n_members=k)"]
+        J[read outputs]
     end
-
-    subgraph modal_orch ["Modal — run_forecast (CPU orchestrator)"]
-        B[ICs on IC Volume?]
-        C[dispatch ingest]
-        F[run_inference.remote<br/>n_members=k]
+    subgraph modal_cpu ["Modal — CPU"]
+        B["orchestrate\n+ ingest ICs → Volume"]
     end
-
-    subgraph modal_ingest ["Modal — ingest (CPU, co-located)"]
-        G[Fetch from IC source]
-        H[Write N320 ICs to IC Volume]
+    subgraph modal_gpu ["Modal — GPU"]
+        G["AIFS-ENS\nmember 0 → 1 → … → k−1"]
     end
-
-    subgraph modal_gpu ["Modal — run_inference (GPU) 🔥"]
-        I[Load ICs from IC Volume]
-        E[Run member 0<br/>seed=0]
-        E1[Run member 1<br/>seed=1]
-        E2[Run member …<br/>seed=…]
-        K[Concat & write to Icechunk]
+    subgraph storage ["Object storage"]
+        IC[("IC source")]
+        OUT[("Icechunk outputs")]
     end
-
-    subgraph storage ["Storage"]
-        VOL[(Modal IC Volume<br/>ephemeral)]
-        OUT[(Icechunk — outputs<br/>S3 / ArrayLake)]
-    end
-
     A --> B
-    B -- "missing" --> C --> G --> H --> VOL
-    H --> F
-    B -- "present" --> F
-    F --> I
-    VOL --> I
-    I --> E --> E1 --> E2 --> K --> OUT --> J
+    IC --> B
+    B --> G
+    G --> OUT
+    OUT --> J
 
-    style modal_orch fill:#555,stroke:#333,color:#fff
-    style B fill:#777,stroke:#333,color:#fff
-    style C fill:#777,stroke:#333,color:#fff
-    style F fill:#777,stroke:#333,color:#fff
-    style modal_ingest fill:#4a90d9,stroke:#2c6fad,color:#fff
-    style G fill:#6aaae0,stroke:#2c6fad,color:#fff
-    style H fill:#6aaae0,stroke:#2c6fad,color:#fff
-    style modal_gpu fill:#ff6b35,stroke:#c44d1a,color:#fff
-    style I fill:#ff8c5a,stroke:#c44d1a,color:#fff
-    style E fill:#ff8c5a,stroke:#c44d1a,color:#fff
-    style E1 fill:#ff8c5a,stroke:#c44d1a,color:#fff
-    style E2 fill:#ff8c5a,stroke:#c44d1a,color:#fff
-    style K fill:#ff8c5a,stroke:#c44d1a,color:#fff
+    style local fill:#555,stroke:#333,color:#fff
+    style A fill:#777,stroke:#555,color:#fff
+    style J fill:#777,stroke:#555,color:#fff
+    style modal_cpu fill:#2c6fad,stroke:#1a4a7a,color:#fff
+    style B fill:#4a90d9,stroke:#2c6fad,color:#fff
+    style modal_gpu fill:#c44d1a,stroke:#8c3210,color:#fff
+    style G fill:#ff6b35,stroke:#c44d1a,color:#fff
+    style storage fill:#1a5c3a,stroke:#0d3d26,color:#fff
+    style IC fill:#2e7d52,stroke:#1a5c3a,color:#fff
+    style OUT fill:#2e7d52,stroke:#1a5c3a,color:#fff
 ```
 
 Each member's output is appended along the `ensemble_member` dimension. This mode is simpler and cheaper (one GPU) but slower for large ensembles.
@@ -136,65 +111,38 @@ Each member's output is appended along the `ensemble_member` dimension. This mod
 Runs all ensemble members simultaneously, each on its own GPU. The orchestration is handled inside `run_forecast` itself (running as a Modal CPU container): it pre-initialises the output arrays from checkpoint metadata, forks the icechunk session, spawns one `run_ensemble_member` container per member, collects the returned forks, and issues a single merge commit. Uses icechunk's [cooperative distributed writes](https://icechunk.io/en/stable/parallel/#distributed-writes).
 
 ```{mermaid}
-flowchart TB
-    subgraph local ["Local (CPU)"]
-        A[Configure forecast<br/>date, n_members, parallel_members=True]
-        J[Read outputs & postprocess]
+flowchart LR
+    subgraph local ["Local"]
+        A["configure\nrun_forecast.remote(parallel_members=True)"]
+        J[read outputs]
     end
-
-    subgraph modal_orch ["Modal run_forecast CPU orchestrator"]
-        B[ICs on IC Volume?]
-        C[dispatch ingest]
-        F[Initialize output store<br/>fork session]
-        P[Spawn run_ensemble_member x n]
-        Q[Merge forks and commit]
+    subgraph modal_cpu ["Modal — CPU"]
+        B["orchestrate + ingest ICs → Volume\nfork icechunk session\nmerge forks + commit"]
     end
-
-    subgraph modal_ingest ["Modal ingest CPU co-located"]
-        G[Fetch from IC source]
-        H[Write N320 ICs to IC Volume]
+    subgraph modal_gpus ["Modal — GPU ×n_members"]
+        G["AIFS-ENS members\n(each on own GPU)"]
     end
-
-    subgraph modal_gpus ["Modal run_ensemble_member"]
-        M0["Member 0<br/>seed=0<br/>inference to write fork"]
-        M1["Member 1<br/>seed=1<br/>inference to write fork"]
-        MN["Member N<br/>seed=N<br/>inference to write fork"]
+    subgraph storage ["Object storage"]
+        IC[("IC source")]
+        OUT[("Icechunk outputs")]
     end
-
-    subgraph storage ["Storage"]
-        VOL[(Modal IC Volume<br/>ephemeral)]
-        OUT[(Icechunk outputs<br/>S3 or ArrayLake)]
-    end
-
     A --> B
-    B -- "missing" --> C --> G --> H --> VOL
-    H --> F
-    B -- "present" --> F
-    F --> P
-    VOL --> M0
-    VOL --> M1
-    VOL --> MN
-    P --> M0
-    P --> M1
-    P --> MN
-    M0 --> Q
-    M1 --> Q
-    MN --> Q
-    Q --> OUT --> J
+    IC --> B
+    B --> G
+    G --> B
+    B --> OUT
+    OUT --> J
 
-    style modal_orch fill:#555,stroke:#333,color:#fff
-    style B fill:#777,stroke:#333,color:#fff
-    style C fill:#777,stroke:#333,color:#fff
-    style F fill:#777,stroke:#333,color:#fff
-    style P fill:#777,stroke:#333,color:#fff
-    style Q fill:#777,stroke:#333,color:#fff
-    style modal_ingest fill:#4a90d9,stroke:#2c6fad,color:#fff
-    style G fill:#6aaae0,stroke:#2c6fad,color:#fff
-    style H fill:#6aaae0,stroke:#2c6fad,color:#fff
-    style modal_gpus fill:#ff6b35,stroke:#c44d1a,color:#fff
-    style M0 fill:#ff8c5a,stroke:#c44d1a,color:#fff
-    style M1 fill:#ff8c5a,stroke:#c44d1a,color:#fff
-    style MN fill:#ff8c5a,stroke:#c44d1a,color:#fff
+    style local fill:#555,stroke:#333,color:#fff
+    style A fill:#777,stroke:#555,color:#fff
+    style J fill:#777,stroke:#555,color:#fff
+    style modal_cpu fill:#2c6fad,stroke:#1a4a7a,color:#fff
+    style B fill:#4a90d9,stroke:#2c6fad,color:#fff
+    style modal_gpus fill:#c44d1a,stroke:#8c3210,color:#fff
+    style G fill:#ff6b35,stroke:#c44d1a,color:#fff
+    style storage fill:#1a5c3a,stroke:#0d3d26,color:#fff
+    style IC fill:#2e7d52,stroke:#1a5c3a,color:#fff
+    style OUT fill:#2e7d52,stroke:#1a5c3a,color:#fff
 ```
 
 **Flow:**
@@ -204,6 +152,10 @@ flowchart TB
 3. It spawns one `run_ensemble_member` container per member. Each gets a GPU, runs AIFS-ENS with `seed=member_id`, writes its output slice with `region="auto"` into the forked session, and returns the fork. No commit happens in the member.
 4. The orchestrator collects all returned forks, merges them (`session.merge(*forks)`), and issues a **single commit**. No conflicts are possible.
 5. Modal queues members beyond your plan's GPU limit automatically — e.g., with a 10-GPU limit, 50 members run in waves of 10.
+
+```{note}
+Parallel mode does **not** deliver a ×`n_members` wall-clock speedup over sequential mode. Container startup overhead and S3 write jitter mean that in practice the parallel ensemble is only modestly faster for moderate ensemble sizes. See the {doc}`sequential vs parallel ensemble benchmark <user-guide/a02-seq-vs-parallel-ens>` for measured timings. Additionally, note that write jitter will result in higher billing costs for the parallel mode than the sequential mode for the same lead time and number of members.
+```
 
 ## Re-running existing forecasts and reproducibility
 
