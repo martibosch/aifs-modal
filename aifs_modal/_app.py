@@ -359,6 +359,22 @@ def _run_member(
     return ds
 
 
+def _apply_dynamical_chunks(ds: xr.Dataset) -> xr.Dataset:
+    """Set per-variable chunk encoding to the dynamical.org ensemble layout.
+
+    One chunk along ``init_time``; full size along ``lead_time``,
+    ``ensemble_member``, and ``pressure``; 320×320 spatial tiles. The full
+    ensemble lands in a single chunk so verification queries (all members at
+    one location, full trajectory) are a single chunk read.
+    """
+    preferred = {"init_time": 1, "lat": 320, "lon": 320}
+    for var in ds.data_vars:
+        ds[var].encoding["chunks"] = tuple(
+            min(preferred.get(d, ds.sizes[d]), ds.sizes[d]) for d in ds[var].dims
+        )
+    return ds
+
+
 # ---------------------------------------------------------------------------
 # IFS (Brighband) and ERA5 (ARCO GCS) co-located ingestion (CPU)
 # ---------------------------------------------------------------------------
@@ -642,6 +658,7 @@ def run_inference(
             for m in range(n_members)
         ]
         ds = xr.concat(member_dss, dim="ensemble_member")
+        ds = _apply_dynamical_chunks(ds)
 
     outputs_session = outputs_repo_obj.writable_session(outputs_branch)
     ds.to_zarr(
