@@ -106,66 +106,14 @@ flowchart LR
 
 Each member's output is appended along the `ensemble_member` dimension. This mode is simpler and cheaper (one GPU) but slower for large ensembles.
 
-## Parallel ensemble forecast (`run_forecast` with `n_members` and `parallel_members=True`)
-
-Runs all ensemble members simultaneously, each on its own GPU. The orchestration is handled inside `run_forecast` itself (running as a Modal CPU container): it pre-initialises the output arrays from checkpoint metadata, forks the icechunk session, spawns one `run_ensemble_member` container per member, collects the returned forks, and issues a single merge commit. Uses icechunk's [cooperative distributed writes](https://icechunk.io/en/stable/parallel/#distributed-writes).
-
-```{mermaid}
-flowchart LR
-    subgraph local ["Local"]
-        A["configure\nrun_forecast.remote(parallel_members=True)"]
-        J[read outputs]
-    end
-    subgraph modal_cpu ["Modal — CPU"]
-        B["orchestrate + ingest ICs → Volume\nfork icechunk session\nmerge forks + commit"]
-    end
-    subgraph modal_gpus ["Modal — GPU ×n_members"]
-        G["AIFS-ENS members\n(each on own GPU)"]
-    end
-    subgraph storage ["Object storage"]
-        IC[("IC source")]
-        OUT[("Icechunk outputs")]
-    end
-    A --> B
-    IC --> B
-    B --> G
-    G --> B
-    B --> OUT
-    OUT --> J
-
-    style local fill:#555,stroke:#333,color:#fff
-    style A fill:#777,stroke:#555,color:#fff
-    style J fill:#777,stroke:#555,color:#fff
-    style modal_cpu fill:#2c6fad,stroke:#1a4a7a,color:#fff
-    style B fill:#4a90d9,stroke:#2c6fad,color:#fff
-    style modal_gpus fill:#c44d1a,stroke:#8c3210,color:#fff
-    style G fill:#ff6b35,stroke:#c44d1a,color:#fff
-    style storage fill:#1a5c3a,stroke:#0d3d26,color:#fff
-    style IC fill:#2e7d52,stroke:#1a5c3a,color:#fff
-    style OUT fill:#2e7d52,stroke:#1a5c3a,color:#fff
-```
-
-**Flow:**
-
-1. The **orchestrator** (`run_forecast`, Modal CPU) checks and ingests ICs as usual.
-2. It introspects the checkpoint output schema on CPU (no GPU needed), builds a zero-filled template for all `n_members`, commits it as the base snapshot, and forks the session.
-3. It spawns one `run_ensemble_member` container per member. Each gets a GPU, runs AIFS-ENS with `seed=member_id`, writes its output slice with `region="auto"` into the forked session, and returns the fork. No commit happens in the member.
-4. The orchestrator collects all returned forks, merges them (`session.merge(*forks)`), and issues a **single commit**. No conflicts are possible.
-5. Modal queues members beyond your plan's GPU limit automatically — e.g., with a 10-GPU limit, 50 members run in waves of 10.
-
-```{note}
-Parallel mode does **not** deliver a ×`n_members` wall-clock speedup over sequential mode. Container startup overhead and S3 write jitter mean that in practice the parallel ensemble is only modestly faster for moderate ensemble sizes. See the {doc}`sequential vs parallel ensemble benchmark <user-guide/a02-seq-vs-parallel-ens>` for measured timings. Additionally, note that write jitter will result in higher billing costs for the parallel mode than the sequential mode for the same lead time and number of members.
-```
-
 ## Re-running existing forecasts and reproducibility
 
 The set up of `aifs-modal` is designed to be used in computational pipelines. Accordingly a key feature is that every step checks whether its output already exists before doing any work, so interrupted or repeated runs pick up where they left off without duplicating effort or GPU cost.
 
-| Step                                 | Skip condition                                                     | Override         |
-| ------------------------------------ | ------------------------------------------------------------------ | ---------------- |
-| IC ingestion in `run_forecast`       | Both IC dates already present on the IC Volume                     | —                |
-| `run_forecast` (deterministic)       | Zarr group for the target date already exists on the output branch | `overwrite=True` |
-| `run_forecast` (sequential ensemble) | Existing group already has ≥ `n_members` along `ensemble_member`   | `overwrite=True` |
-| `run_forecast` (parallel ensemble)   | Same as above, checked before spawning any containers              | `overwrite=True` |
+| Step                           | Skip condition                                                     | Override         |
+| ------------------------------ | ------------------------------------------------------------------ | ---------------- |
+| IC ingestion in `run_forecast` | Both IC dates already present on the IC Volume                     | —                |
+| `run_forecast` (deterministic) | Zarr group for the target date already exists on the output branch | `overwrite=True` |
+| `run_forecast` (ensemble)      | Existing group already has ≥ `n_members` along `ensemble_member`   | `overwrite=True` |
 
 **Ensemble reproducibility.** Each ensemble member fixes the PyTorch random seed to its member index (`torch.manual_seed(member_id)`) before running AIFS-ENS. This means that member *k* always produces the same trajectory regardless of how many members are in the ensemble or how they are distributed across containers, making it straightforward to extend an existing ensemble run by increasing `n_members` (existing members are skipped, only the new ones are computed).

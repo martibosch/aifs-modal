@@ -4576,7 +4576,7 @@ packages:
 - pypi: ./
   name: aifs-modal
   version: 0.0.0
-  sha256: 93757ac688c6d6d1b5f7b4cde0567487d863687e6a1f39035d3324eadb9675b7
+  sha256: 56fdaaacedc2a8fc70bf8e1e59835c19baa33b43c877679bcda49117744a14d9
   requires_dist:
   - earthkit-data[cds]
   - gcsfs>=2022.11.0
