@@ -508,6 +508,37 @@ def run_forecast(
     if source is None:
         source = settings.DEFAULT_IC_SOURCE
 
+    if not overwrite:
+        base_group = utils.datetime_to_str(date)
+        try:
+            outputs_repo_obj = _open_outputs_repo(
+                storage_bucket,
+                outputs_repo=outputs_repo,
+                outputs_prefix=outputs_prefix,
+                storage_type=storage_type,
+            )
+            if outputs_branch not in outputs_repo_obj.list_branches():
+                raise ValueError
+            readonly_session = outputs_repo_obj.readonly_session(outputs_branch)
+            existing = xr.open_dataset(
+                readonly_session.store,
+                group=base_group,
+                engine="zarr",
+                zarr_format=3,
+                chunks=None,
+            )
+            if (
+                n_members is None
+                or existing.sizes.get("ensemble_member", 0) >= n_members
+            ):
+                print(
+                    f"Forecast already exists for {date.isoformat()} "
+                    f"(group: {base_group}); skipping"
+                )
+                return
+        except Exception:
+            pass
+
     ic_volume.reload()
     if not _ic_dates_present(date, settings.IC_DIR):
         start = (date - datetime.timedelta(hours=6)).isoformat()
