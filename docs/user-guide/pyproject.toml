@@ -1,0 +1,9 @@
+[tool.ruff]
+extend = "../../pyproject.toml"
+
+[tool.ruff.lint.isort]
+known-first-party = [
+  "aifs_modal",
+  "plot_utils",
+  "storage_utils"
+]

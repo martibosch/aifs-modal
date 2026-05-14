@@ -46,8 +46,7 @@ dev = [
 ]
 doc = [
   "ipykernel",
-  "myst-parser",
-  "nbsphinx",
+  "myst-nb",
   "pydata-sphinx-theme",
   "sphinx",
   "sphinxcontrib-mermaid",
@@ -110,6 +109,9 @@ uv = ">=0.6"
 
 [tool.pixi.feature.dev.tasks]
 build = {cmd = "uv build"}
+
+[tool.pixi.feature.doc.dependencies]
+sphinxcontrib-bibtex = ">=2.7.0,<3"
 
 [tool.pixi.feature.doc.tasks]
 build-doc = {cmd = "sphinx-build docs docs/_build"}

@@ -2,7 +2,7 @@
 
 This page describes the architecture of `aifs_modal`, focusing on how AIFS forecasts are run within computational pipelines, highlighting what is executed locally versus on Modal and how data inputs and outputs are stored at each step.
 
-Note that this set up is not intended for running an operational AIFS forecasting platform but rather as a playground to run AIFS forecasts for scientific experiments, where the pre-processing, forecasts and post-processing can be run interactively within the same local notebook, with only the forecasts running on a *serverless* GPU environment and with a task-based approach that prevents unnecessary duplication of work when re-running cells or iterating on the analysis (see the [Re-running existing forecasts and reproducibility](#re-running-existing-forecasts-and-reproducibility) section below). See the {doc}`example notebooks <user-guide/index>` for practical example applications of this set up.
+Note that this set up is not intended for running an operational AIFS forecasting platform but rather as a playground to run AIFS forecasts for scientific experiments, where the pre-processing, forecasts and post-processing can be run interactively within the same local notebook, with only the forecasts running on a *serverless* GPU environment and with a task-based approach that prevents unnecessary duplication of work when re-running cells or iterating on the analysis (see the {ref}`re-running-existing-forecasts-and-reproducibility` section below). Idempotency operates at two levels: `run_forecast` checks for existing outputs on the Modal side before ingesting ICs or starting inference; `forecast_exists` provides the same check locally, so the ephemeral app is never spun up when the forecast is already complete. See the {doc}`example notebooks <user-guide/index>` for practical example applications of this set up.
 
 ## Key concepts
 
@@ -61,7 +61,7 @@ flowchart LR
 
 **Flow:**
 
-1. **Orchestrate** (Modal CPU, `run_forecast`): check the IC Volume for the target date. If ICs are missing, dispatch `ingest_ifs_arraylake` (Modal `us-east`) or `ingest_era5_arco` (Modal `us-central1`) and wait for completion; inline sources (`ifs-ekd`, `era5-cds`) run directly inside the orchestrator. Skipped if ICs are already present.
+1. **Orchestrate** (Modal CPU, `run_forecast`): check whether the forecast output already exists; if so, return immediately without ingesting ICs or starting inference. Otherwise, check the IC Volume for the target date. If ICs are missing, dispatch `ingest_ifs_arraylake` (Modal `us-east`) or `ingest_era5_arco` (Modal `us-central1`) and wait for completion; inline sources (`ifs-ekd`, `era5-cds`) run directly inside the orchestrator.
 2. **Ingest** (Modal CPU, co-located): download and regrid the IC fields to N320; write them to the IC Volume.
 3. **Inference** (Modal GPU, `run_inference`): load initial conditions from the IC Volume, run the AIFS model, regrid output fields from N320 to 0.25° lat/lon, and stream each 6-hourly step to the outputs Icechunk repository.
 4. **Post-process** (local, CPU): open the outputs repository with xarray and analyze them.
@@ -106,14 +106,18 @@ flowchart LR
 
 Each member's output is appended along the `ensemble_member` dimension. This mode is simpler and cheaper (one GPU) but slower for large ensembles.
 
+(re-running-existing-forecasts-and-reproducibility)=
+
 ## Re-running existing forecasts and reproducibility
 
 The set up of `aifs-modal` is designed to be used in computational pipelines. Accordingly a key feature is that every step checks whether its output already exists before doing any work, so interrupted or repeated runs pick up where they left off without duplicating effort or GPU cost.
 
-| Step                           | Skip condition                                                     | Override         |
-| ------------------------------ | ------------------------------------------------------------------ | ---------------- |
-| IC ingestion in `run_forecast` | Both IC dates already present on the IC Volume                     | —                |
-| `run_forecast` (deterministic) | Zarr group for the target date already exists on the output branch | `overwrite=True` |
-| `run_forecast` (ensemble)      | Existing group already has ≥ `n_members` along `ensemble_member`   | `overwrite=True` |
+Idempotency operates at two levels. The **local check** (`forecast_exists`) runs in the notebook before `app.run()` — if it returns `True`, the ephemeral app is never created. The **Modal-side check** (`run_forecast`) runs inside the orchestrator — if the output already exists, ingestion and inference are skipped without consuming a GPU.
+
+| Step                           | Where | Skip condition                                      | Override         |
+| ------------------------------ | ----- | --------------------------------------------------- | ---------------- |
+| `forecast_exists`              | local | Output group exists and has enough members          | —                |
+| `run_forecast` output check    | Modal | Same as above — prevents IC ingestion and inference | `overwrite=True` |
+| IC ingestion in `run_forecast` | Modal | Both IC dates already present on the IC Volume      | —                |
 
 **Ensemble reproducibility.** Each ensemble member fixes the PyTorch random seed to its member index (`torch.manual_seed(member_id)`) before running AIFS-ENS. This means that member *k* always produces the same trajectory regardless of how many members are in the ensemble or how they are distributed across containers, making it straightforward to extend an existing ensemble run by increasing `n_members` (existing members are skipped, only the new ones are computed).
