@@ -190,30 +190,23 @@ def _get_all_cds(date: datetime.datetime) -> dict[str, np.ndarray]:
 # ---------------------------------------------------------------------------
 
 
+def get_all_data(date: datetime.datetime, cds: bool = False) -> dict[str, np.ndarray]:
+    """Fetch all fields for *date* from ECMWF open-data (default) or CDS ERA5."""
+    if cds:
+        return _get_all_cds(date)
+    return _get_all_open_data(date)
+
+
 def ingest(
     start_date: str,
     end_date: str,
-    storage_bucket: str,
+    ic_dir: str,
     source: str,
-    *,
-    initial_conditions_prefix: str | None = None,
-    initial_conditions_branch: str = "main",
-    storage_type: str = "tigris",
 ) -> None:
-    """Ingest IFS-open-data or ERA5/CDS initial conditions into an icechunk store."""
-    # fetch_fn = lambda d: get_all_data(d, cds=cds)
+    """Ingest IFS-open-data or ERA5/CDS initial conditions into a local zarr store."""
     if source == "ifs-ekd":
         fetch_fn = _get_all_open_data
     else:  # source == "era5-cds"
         fetch_fn = _get_all_cds
 
-    ic.ingest_range(
-        start_date,
-        end_date,
-        storage_bucket,
-        fetch_fn,
-        source=source,
-        initial_conditions_prefix=initial_conditions_prefix,
-        initial_conditions_branch=initial_conditions_branch,
-        storage_type=storage_type,
-    )
+    ic.ingest_range(start_date, end_date, ic_dir, fetch_fn, source=source)
