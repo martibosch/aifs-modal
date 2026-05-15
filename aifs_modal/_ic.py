@@ -9,7 +9,7 @@ variable map + ``get_all_data``.
 import datetime
 import os
 import shutil
-from typing import Callable
+from collections.abc import Callable
 
 import earthkit.regrid as ekr
 import numpy as np
