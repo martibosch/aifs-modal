@@ -11,10 +11,11 @@
 
 ## Features
 
-- **Three forecast modes**: deterministic (AIFS-Single), sequential ensemble (AIFS-ENS, one GPU), and parallel ensemble (one GPU per member using cooperative distributed writes).
+- **Two forecast modes**: deterministic (AIFS-Single), ensemble (AIFS-ENS).
 - **Versioned array storage via [Icechunk](https://icechunk.io)**: forecast outputs are stored with git-like branching and commit history, so you can reproduce any past run and safely extend ensemble experiments. All [storage backends supported by Icechunk](https://icechunk.io/en/stable/storage/) are available (Tigris, AWS S3, Cloudflare R2, Google Cloud Storage, Azure Blob Storage, Earthmover ArrayLake).
 - **Task-based pipeline**: ingestion and inference are framed as pipeline steps, skipped when outputs already exist. Re-running a notebook cell never duplicates work or wastes GPU resources.
 - **Reproducible ensembles**: each member is seeded by its index (`torch.manual_seed(member_id)`), so you can safely extend an ensemble run later by increasing `n_members`.
+  - **Flexible initial conditions**: ingest from operational IFS HRES via [the Earthmover Mar](https://app.earthmover.io/marketplace/697162921880507a6587c31b) (default, alternatively [ECMWF open data](https://www.ecmwf.int/en/forecasts/datasets/open-data) without any login needed) or ERA5 (via [Google ARCO-ERA5](https://cloud.google.com/storage/docs/public-datasets/era5) or [Copernicus CDS](https://cds.climate.copernicus.eu/)), or any custom field array following the AIFS variable convention.
 
 ## Why aifs-modal?
 
@@ -26,11 +27,19 @@ Two publicly accessible AIFS archives already exist: the [ECMWF operational arch
 
 3. **Custom initial conditions**: ingestion and inference are decoupled, so any field array following the AIFS variable convention can serve as initial conditions. Applications include perturbed or bias-corrected states from climate-model scenarios. See the [CMIP6 SST-patch notebook](https://aifs-modal.readthedocs.io/en/latest/user-guide/cmip6-sst-patch.html) for an example patching ERA5 sea-surface temperatures to mimic a warmer-climate storyline before running the forecast.
 
+4. **Custom checkpoints**: the built-in AIFS-Single and AIFS-ENS checkpoints can be overridden via the `checkpoint` parameter of `run_forecast`, accepting any [anemoi-inference](https://anemoi-inference.readthedocs.io)-compatible checkpoint — `aifs-modal` reads the required variable set from the checkpoint and automatically drops any surplus IC variables. Applications include models fine-tuned on regional data or trained with domain-specific variables.
+
 ![AIFS-Single 96-hour forecast over Europe](https://raw.githubusercontent.com/martibosch/aifs-modal/main/docs/figures/forecast-europe.png)
 *AIFS-Single deterministic 96-hour forecast of 2-meter temperature over Europe.*
 
+![AIFS-Single 105-day jet-stream free run vs ERA5 climatology](https://raw.githubusercontent.com/martibosch/aifs-modal/main/docs/figures/jet-stream-vs-era5.png)
+*AIFS-Single 105-day free-run forecast of the NH jet stream compared against ERA5 climatology.*
+
 ![AIFS-ENS ensemble forecast for Lausanne](https://raw.githubusercontent.com/martibosch/aifs-modal/main/docs/figures/ensemble-forecast-lausanne.png)
 *AIFS-ENS 10-member ensemble forecast of 2-meter temperature for Lausanne, verified against MeteoSwiss station data.*
+
+![AIFS-Single SST-patch forecast](https://raw.githubusercontent.com/martibosch/aifs-modal/main/docs/figures/sst-patch-forecast.png)
+*AIFS-Single forecast difference (warmer SST − baseline) showing the downstream impact of a CMIP6 SST patch on 2-meter temperature.*
 
 ## Usage
 

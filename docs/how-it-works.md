@@ -7,6 +7,7 @@ Note that this set up is not intended for running an operational AIFS forecastin
 ## Key concepts
 
 - **AIFS** (Artificial Intelligence Forecasting System): ECMWF's machine-learning weather model. Two checkpoints are available: [AIFS-Single](https://huggingface.co/ecmwf/aifs-single-1.1) (deterministic) and [AIFS-ENS](https://huggingface.co/ecmwf/aifs-ens-1.0) (ensemble, stochastic perturbations via random seeds).
+- **Custom checkpoints**: any [anemoi-inference](https://anemoi-inference.readthedocs.io)-compatible checkpoint can override the built-in defaults by passing a `checkpoint` dict to `run_forecast` or `run_inference` (e.g. `{"huggingface": "org/fine-tuned-model"}` or a path on a Modal Volume). `aifs-modal` reads `variable_to_input_tensor_index` directly from the checkpoint and silently drops any IC variables the model does not expect, so the IC source does not need to be trimmed manually. Requirements: (1) the checkpoint must be in anemoi-inference format (a `.ckpt` file produced by anemoi-training); (2) it must operate on the **N320 reduced Gaussian grid** — the output regridder is hardcoded to N320 → 0.25° lat/lon; (3) the IC source must cover at minimum the full set of variables the checkpoint requires.
 - **Modal**: serverless GPU platform. Forecast inference runs on Modal containers with GPU access. Ingestion and orchestration also run on Modal (CPU), with workers co-located with IC sources for in-region bandwidth.
 - **Icechunk**: versioned array storage engine backed by S3-compatible object storage. Used for forecast outputs, providing git-like branching and commit history.
 - **Initial conditions**: analysis fields ingested from an IC source (Brightband, ARCO-ERA5, or ECMWF open data), regridded to the N320 reduced Gaussian grid and written to a shared Modal IC Volume. AIFS requires two consecutive 6-hourly analyses (t−6h and t) as input. The Volume is a temporary per-run cache; ICs are deleted after successful inference unless `keep_ics=True`.
@@ -63,10 +64,10 @@ flowchart LR
 
 1. **Orchestrate** (Modal CPU, `run_forecast`): check whether the forecast output already exists; if so, return immediately without ingesting ICs or starting inference. Otherwise, check the IC Volume for the target date. If ICs are missing, dispatch `ingest_ifs_arraylake` (Modal `us-east`) or `ingest_era5_arco` (Modal `us-central1`) and wait for completion; inline sources (`ifs-ekd`, `era5-cds`) run directly inside the orchestrator.
 2. **Ingest** (Modal CPU, co-located): download and regrid the IC fields to N320; write them to the IC Volume.
-3. **Inference** (Modal GPU, `run_inference`): load initial conditions from the IC Volume, run the AIFS model, regrid output fields from N320 to 0.25° lat/lon, and stream each 6-hourly step to the outputs Icechunk repository.
+3. **Inference** (Modal GPU, `run_inference`): load initial conditions from the IC Volume, load the checkpoint into `SimpleRunner`, drop any IC variables not required by the checkpoint, run the AIFS model, regrid output fields from N320 to 0.25° lat/lon, and stream each 6-hourly step to the outputs Icechunk repository.
 4. **Post-process** (local, CPU): open the outputs repository with xarray and analyze them.
 
-## Sequential ensemble forecast (`run_forecast` with `n_members`)
+## Ensemble forecast (`run_forecast` with `n_members`)
 
 Runs multiple AIFS-ENS members one after another on a single GPU. Each member uses a different random seed for stochastic perturbations. Ingestion and orchestration are identical to the deterministic case; the difference is that `run_inference` loops over members on the same GPU.
 
