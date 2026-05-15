@@ -234,42 +234,6 @@ def state_to_xarray(state, regridder, init_time, include_pressure_levels=False):
     return ds.drop_vars(to_drop)
 
 
-def _make_fetch_fn(
-    source: str,
-    *,
-    source_repo: str | None = None,
-    source_branch: str = "main",
-):
-    """Resolve a source label into a ``fetch_fn(date) -> dict`` callable."""
-    if source == "ifs-ekd":
-        return ingest_ekd.get_all_data
-    if source == "era5-cds":
-        return lambda d: ingest_ekd.get_all_data(d, cds=True)
-    if source == "era5-arco":
-        from aifs_modal import _ingest_era5_arco as ingest_arco
-
-        # ACHTUNG: import here because of optional `gcsfs` dep
-        return ingest_arco.get_all_data
-    if source == "ifs-arraylake":
-        import arraylake as al
-
-        from aifs_modal import _ingest_ifs_arraylake as ingest_arraylake
-
-        # ACHTUNG: import here because of optional `arraylake` dep
-        if source_repo is None:
-            raise ValueError("source_repo is required when source='ifs-arraylake'")
-        with _without_aws_env():
-            al_client = al.Client(token=os.environ["ARRAYLAKE_API_TOKEN"])
-        al_session = al_client.get_repo(source_repo).readonly_session(source_branch)
-        source_ds = xr.open_dataset(
-            al_session.store, engine="zarr", zarr_format=3, chunks={}
-        )
-        return lambda d: ingest_arraylake.get_all_data(source_ds, d)
-    raise ValueError(
-        f"Unknown source: {source!r}. Must be one of: {', '.join(settings.IC_SOURCES)}"
-    )
-
-
 def _require_outputs_target(
     outputs_repo: str | None, outputs_prefix: str | None
 ) -> None:
@@ -388,40 +352,35 @@ def _apply_dynamical_chunks(ds: xr.Dataset) -> xr.Dataset:
 def ingest_ifs_arraylake(
     start_date: str,
     end_date: str,
+    ic_source_repo: str,
     *,
-    source_repo: str,
-    source_branch: str = "main",
-    source_static_branch: str = "add-static-vars",
+    ic_source_branch: str = "main",
+    ic_source_static_branch: str = "add-static-vars",
 ) -> None:
     """IFS-arraylake ingestion, co-located with the Cloudflare R2 ENAM bucket."""
     import arraylake as al
 
-    from aifs_modal import _ingest_ifs_arraylake as ingest_arraylake
+    from aifs_modal import _ingest_ifs_arraylake
 
     with _without_aws_env():
         al_client = al.Client(token=os.environ["ARRAYLAKE_API_TOKEN"])
-    al_repo = al_client.get_repo(source_repo)
+    al_repo = al_client.get_repo(ic_source_repo)
     source_ds = xr.open_dataset(
-        al_repo.readonly_session(source_branch).store,
+        al_repo.readonly_session(ic_source_branch).store,
         engine="zarr",
         zarr_format=3,
         chunks={},
     )
-    # TODO: remove source_static_branch once static vars are merged to main
+    # TODO: remove ic_source_static_branch once static vars are merged to main
     static_ds = xr.open_dataset(
-        al_repo.readonly_session(source_static_branch).store,
+        al_repo.readonly_session(ic_source_static_branch).store,
         engine="zarr",
         zarr_format=3,
         chunks={},
     )
-    static_data = ingest_arraylake._read_static_fields(static_ds)
-
-    # fetch_fn = lambda d: ingest_arraylake.get_all_data(source_ds, d, static_data)
-    def fetch_fn(d):
-        return ingest_arraylake.get_all_data(source_ds, d, static_data)
-
-    ic.ingest_range(
-        start_date, end_date, settings.IC_DIR, fetch_fn, source="ifs-arraylake"
+    static_data = _ingest_ifs_arraylake._read_static_fields(static_ds)
+    _ingest_ifs_arraylake.ingest(
+        start_date, end_date, settings.IC_DIR, source_ds, static_data
     )
     ic_volume.commit()
 
@@ -440,13 +399,7 @@ def ingest_era5_arco(
     """ARCO-ERA5 ingestion, co-located with the ``us-central1`` bucket."""
     from aifs_modal import _ingest_era5_arco as ingest_arco
 
-    ic.ingest_range(
-        start_date,
-        end_date,
-        settings.IC_DIR,
-        ingest_arco.get_all_data,
-        source="era5-arco",
-    )
+    ingest_arco.ingest(start_date, end_date, settings.IC_DIR)
     ic_volume.commit()
 
 
@@ -463,10 +416,10 @@ def run_forecast(
     date: datetime.datetime,
     storage_bucket: str,
     *,
-    source: str | None = None,
-    source_repo: str | None = None,
-    source_branch: str = "main",
-    source_static_branch: str = "add-static-vars",
+    ic_source: str | None = None,
+    ic_source_repo: str | None = None,
+    ic_source_branch: str = "main",
+    ic_source_static_branch: str = "add-static-vars",
     lead_time: int | None = None,
     outputs_repo: str | None = None,
     outputs_prefix: str | None = None,
@@ -488,13 +441,13 @@ def run_forecast(
 
     Parameters
     ----------
-    source : str, optional
+    ic_source : str, optional
         One of :data:`aifs_modal.settings.IC_SOURCES`. Defaults to
         :data:`aifs_modal.settings.DEFAULT_IC_SOURCE`.  ICs already present in
         the target volume are skipped.
-    source_repo : str, optional
-        ArrayLake repository name. Required when ``source="ifs-arraylake"``.
-    source_branch : str, optional
+    ic_source_repo : str, optional
+        ArrayLake repository name. Required when ``ic_source="ifs-arraylake"``.
+    ic_source_branch : str, optional
         Branch in the ArrayLake source repository. Default ``"main"``.
     keep_ics : bool, optional
         If ``False`` (default), IC data is deleted from the Modal Volume after
@@ -505,8 +458,8 @@ def run_forecast(
         AIFS-Single forecast.
     """
     _require_outputs_target(outputs_repo, outputs_prefix)
-    if source is None:
-        source = settings.DEFAULT_IC_SOURCE
+    if ic_source is None:
+        ic_source = settings.DEFAULT_IC_SOURCE
 
     if not overwrite:
         base_group = utils.datetime_to_str(date)
@@ -543,21 +496,22 @@ def run_forecast(
     if not _ic_dates_present(date, settings.IC_DIR):
         start = (date - datetime.timedelta(hours=6)).isoformat()
         end = date.isoformat()
-        if source == "era5-arco":
+        if ic_source == "era5-arco":
             ingest_era5_arco.remote(start, end)
-        elif source == "ifs-arraylake":
+        elif ic_source == "ifs-arraylake":
+            if ic_source_repo is None:
+                raise ValueError(
+                    "ic_source_repo is required when ic_source='ifs-arraylake'"
+                )
             ingest_ifs_arraylake.remote(
                 start,
                 end,
-                source_repo=source_repo,
-                source_branch=source_branch,
-                source_static_branch=source_static_branch,
+                ic_source_repo,
+                ic_source_branch=ic_source_branch,
+                ic_source_static_branch=ic_source_static_branch,
             )
-        else:
-            fetch_fn = _make_fetch_fn(
-                source, source_repo=source_repo, source_branch=source_branch
-            )
-            ic.ingest_range(start, end, settings.IC_DIR, fetch_fn, source=source)
+        else:  # ifs-ekd or era5-cds
+            ingest_ekd.ingest(start, end, settings.IC_DIR, ic_source)
             ic_volume.commit()
 
     if checkpoint is None:

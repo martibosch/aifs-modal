@@ -13,17 +13,14 @@ Transformations applied on top of the source data:
 - geopotential unit conversion (z in m² s⁻² → gh = z / g in m)
 """
 
-import datetime
+import os
 
-import icechunk
 import numpy as np
 import xarray as xr
-import zarr
 
 from aifs_modal import _ic as ic
-from aifs_modal import settings, utils
+from aifs_modal import utils
 from aifs_modal._ic import _G, LEVELS, _regrid_n320
-from aifs_modal.utils import _STORAGE_TYPES
 
 # Surface / single-level vars. Brightband uses ECMWF short names.
 _SFC_MAP = {
@@ -38,9 +35,8 @@ _SFC_MAP = {
     "tcwv": "tcwv",
 }
 
-# TODO: once static vars are merged to the main Brightband branch, read them
-# there and remove source_static_branch from the ingest API.
-_STATIC_BRANCH = "add-static-vars"
+# TODO: once static vars are merged to the main Brightband branch, remove
+# source_static_branch from the ingest API.
 _STATIC_VARS = ["lsm", "z_sfc", "slor", "sdor"]
 _STATIC_RENAME = {"z_sfc": "z"}  # z_sfc → z (surface orography)
 
@@ -113,91 +109,31 @@ def _flatten_date(
     return data
 
 
-def get_all_data(
-    ds: xr.Dataset,
-    init_time: datetime.datetime,
-    static_data: dict[str, np.ndarray] | None = None,
-) -> dict[str, np.ndarray]:
-    """Fetch one date's variables. Per-date path used at forecast time."""
-    init_time = init_time.replace(tzinfo=None)
-    src = ds.sel(init_time=init_time).isel(lead_time=0)
-    src = src.rename(_build_rename_map(src))
-    src = src.compute()
-    data = _flatten_date(src, _pl_src_prefixes(src))
-    if static_data:
-        data.update(static_data)
-    return data
-
-
 def ingest(
     start_date: str,
     end_date: str,
-    storage_bucket: str,
-    *,
-    client,
-    source_repo: str,
-    source_branch: str = "main",
-    source_static_branch: str = _STATIC_BRANCH,
-    initial_conditions_prefix: str | None = None,
-    initial_conditions_branch: str = "main",
-    storage_type: str = "tigris",
+    ic_dir: str,
+    source_ds: xr.Dataset,
+    static_data: dict[str, np.ndarray],
 ) -> None:
-    """Ingest Brightband IFS initial conditions into a target icechunk store.
+    """Ingest Brightband IFS initial conditions into a local zarr store.
 
-    Parameters
-    ----------
-    client : arraylake.Client
-        Authenticated ArrayLake client.
-    source_repo : str
-        ArrayLake repository name (e.g. ``"brightband/ecmwf-ifs-initial-conditions"``).
-    source_branch : str, optional
-        Branch in the source repository. Default ``"main"``.
-    source_static_branch : str, optional
-        Branch that carries the time-invariant surface fields (``lsm``, ``z``,
-        ``slor``, ``sdor``). Default ``"add-static-vars"``.
+    Reads all missing dates in a single batched ``.sel()`` to avoid
+    per-date dask graph rebuilding, then writes each date individually.
     """
-    from aifs_modal._ic import _iter_dates_6h, _parse_utc_date
-
-    start = _parse_utc_date(start_date)
-    end = _parse_utc_date(end_date)
+    start = ic._parse_utc_date(start_date)
+    end = ic._parse_utc_date(end_date)
     if end < start:
         raise ValueError(
             f"end_date must be >= start_date (got {start_date!r} -> {end_date!r})"
         )
-    if storage_type not in _STORAGE_TYPES:
-        raise ValueError(
-            f"Unknown storage_type: {storage_type!r}. "
-            f"Must be one of: {', '.join(_STORAGE_TYPES)}"
-        )
-    if initial_conditions_prefix is None:
-        initial_conditions_prefix = settings.DEFAULT_IC_PREFIXES["ifs-arraylake"]
 
-    al_repo = client.get_repo(source_repo)
-    source_session = al_repo.readonly_session(source_branch)
-    source_ds = xr.open_dataset(
-        source_session.store, engine="zarr", zarr_format=3, chunks={}
-    )
-    static_session = al_repo.readonly_session(source_static_branch)
-    static_ds = xr.open_dataset(
-        static_session.store, engine="zarr", zarr_format=3, chunks={}
-    )
-    static_data = _read_static_fields(static_ds)
-
-    storage = utils.get_storage(storage_bucket, initial_conditions_prefix, storage_type)
-    repo = icechunk.Repository.open_or_create(storage)
-    ic._ensure_source_stamp(repo, initial_conditions_branch, "ifs-arraylake")
-
-    readonly_session = repo.readonly_session(initial_conditions_branch)
-    dates = list(_iter_dates_6h(start, end))
-    missing: list[datetime.datetime] = []
-    for date in dates:
-        group_name = utils.datetime_to_str(date)
-        try:
-            zarr.open_group(
-                readonly_session.store, path=group_name, mode="r", zarr_format=3
-            )
-        except zarr.errors.GroupNotFoundError:
-            missing.append(date)
+    dates = list(ic._iter_dates_6h(start, end))
+    missing = [
+        d
+        for d in dates
+        if not os.path.exists(os.path.join(ic_dir, utils.datetime_to_str(d)))
+    ]
 
     if not missing:
         print(
@@ -206,30 +142,25 @@ def ingest(
         )
         return
 
-    # batch read: one .sel() over all missing dates collapses the per-date dask
-    # graph rebuild that was the main cost of the previous per-date pattern.
     print(f"batch-reading {len(missing)} dates from arraylake")
     init_times = np.array(
         [d.replace(tzinfo=None) for d in missing], dtype="datetime64[ns]"
     )
     src = source_ds.sel(init_time=init_times).isel(lead_time=0)
     src = src.rename(_build_rename_map(src))
-    pl_src_prefixes = _pl_src_prefixes(src)
-
+    pl_prefixes = _pl_src_prefixes(src)
     print("computing source slice")
     src = src.compute()
 
-    session = repo.writable_session(initial_conditions_branch)
+    os.makedirs(ic_dir, exist_ok=True)
     for i, date in enumerate(missing, start=1):
-        print(f"[{i}/{len(missing)}] writing {date.isoformat()}")
+        print(f"[{i}/{len(missing)}] writing ifs-arraylake {date.isoformat()}")
         date_ds = src.sel(init_time=np.datetime64(date.replace(tzinfo=None), "ns"))
-        data = _flatten_date(date_ds, pl_src_prefixes)
+        data = _flatten_date(date_ds, pl_prefixes)
         data.update(static_data)
-        ic.get_and_store_date(date, session, lambda _d, _data=data: _data)
+        ic.get_and_store_date(date, ic_dir, lambda _d, _data=data: _data)
 
-    commit_msg = (
+    print(
         f"Wrote ifs-arraylake initial conditions from {start.isoformat()} "
         f"to {end.isoformat()} ({len(missing)}/{len(dates)} new dates)"
     )
-    session.commit(commit_msg)
-    print(commit_msg)

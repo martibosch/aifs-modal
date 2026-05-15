@@ -190,13 +190,6 @@ def _get_all_cds(date: datetime.datetime) -> dict[str, np.ndarray]:
 # ---------------------------------------------------------------------------
 
 
-def get_all_data(date: datetime.datetime, cds: bool = False) -> dict[str, np.ndarray]:
-    """Fetch all fields for *date* from ECMWF open-data (default) or CDS ERA5."""
-    if cds:
-        return _get_all_cds(date)
-    return _get_all_open_data(date)
-
-
 def ingest(
     start_date: str,
     end_date: str,
@@ -209,4 +202,4 @@ def ingest(
     else:  # source == "era5-cds"
         fetch_fn = _get_all_cds
 
-    ic.ingest_range(start_date, end_date, ic_dir, fetch_fn, source=source)
+    ic._ingest_range(start_date, end_date, ic_dir, fetch_fn, source=source)

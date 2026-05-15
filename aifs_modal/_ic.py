@@ -2,8 +2,8 @@
 
 All ingest backends produce ``dict[str, np.ndarray]`` for one date and hand it
 to :func:`get_and_store_date`, which writes a uniform zarr group under *ic_dir*.
-:func:`ingest_range` wraps the per-date loop so each backend module is just a
-variable map + ``get_all_data``.
+Each backend module exposes ``ingest(start, end, ic_dir, ...)`` and calls the
+private :func:`_ingest_range` helper, which owns the per-date loop.
 """
 
 import datetime
@@ -130,7 +130,7 @@ def delete_ic_dates(date: datetime.datetime, ic_dir: str) -> None:
             print(f"deleted IC directory {path}")
 
 
-def ingest_range(
+def _ingest_range(
     start_date: str,
     end_date: str,
     ic_dir: str,

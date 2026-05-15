@@ -144,23 +144,6 @@ def get_all_data(date: datetime.datetime) -> dict[str, np.ndarray]:
     return data
 
 
-def ingest(
-    start_date: str,
-    end_date: str,
-    storage_bucket: str,
-    *,
-    initial_conditions_prefix: str | None = None,
-    initial_conditions_branch: str = "main",
-    storage_type: str = "tigris",
-) -> None:
-    """Ingest ARCO-ERA5 initial conditions into an icechunk store."""
-    ic.ingest_range(
-        start_date,
-        end_date,
-        storage_bucket,
-        get_all_data,
-        source="era5-arco",
-        initial_conditions_prefix=initial_conditions_prefix,
-        initial_conditions_branch=initial_conditions_branch,
-        storage_type=storage_type,
-    )
+def ingest(start_date: str, end_date: str, ic_dir: str) -> None:
+    """Ingest ARCO-ERA5 initial conditions into a local zarr store."""
+    ic._ingest_range(start_date, end_date, ic_dir, get_all_data, source="era5-arco")
