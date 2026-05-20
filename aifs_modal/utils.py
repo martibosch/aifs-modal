@@ -4,8 +4,25 @@ import datetime
 import os
 
 import icechunk
+import xarray as xr
 
 _STORAGE_TYPES = ("tigris", "s3", "r2", "gcs", "azure")
+
+
+def apply_trajectory_chunks(ds: xr.Dataset) -> xr.Dataset:
+    """Set per-variable chunk encoding for efficient trajectory queries.
+
+    One chunk along ``init_time``; full size along ``lead_time``,
+    ``ensemble_member``, and ``pressure``; 241×240 spatial tiles (≈60°×60°,
+    three near-equal tiles per hemisphere). The full forecast trajectory at
+    any location is a single chunk read.
+    """
+    preferred = {"init_time": 1, "lat": 241, "lon": 240}
+    for var in ds.data_vars:
+        ds[var].encoding["chunks"] = tuple(
+            min(preferred.get(d, ds.sizes[d]), ds.sizes[d]) for d in ds[var].dims
+        )
+    return ds
 
 
 def get_storage(storage_bucket: str, prefix: str | None, storage_type: str = "tigris"):

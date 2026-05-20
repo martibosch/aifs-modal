@@ -18,6 +18,7 @@ to their dedicated co-located functions (``ingest_era5_arco``,
 import contextlib
 import datetime
 import os
+from collections.abc import Callable
 from os import path
 
 import earthkit.regrid as ekr
@@ -323,22 +324,6 @@ def _run_member(
     return ds
 
 
-def _apply_dynamical_chunks(ds: xr.Dataset) -> xr.Dataset:
-    """Set per-variable chunk encoding to the dynamical.org ensemble layout.
-
-    One chunk along ``init_time``; full size along ``lead_time``,
-    ``ensemble_member``, and ``pressure``; 320×320 spatial tiles. The full
-    ensemble lands in a single chunk so verification queries (all members at
-    one location, full trajectory) are a single chunk read.
-    """
-    preferred = {"init_time": 1, "lat": 320, "lon": 320}
-    for var in ds.data_vars:
-        ds[var].encoding["chunks"] = tuple(
-            min(preferred.get(d, ds.sizes[d]), ds.sizes[d]) for d in ds[var].dims
-        )
-    return ds
-
-
 # ---------------------------------------------------------------------------
 # IFS (Brighband) and ERA5 (ARCO GCS) co-located ingestion (CPU)
 # ---------------------------------------------------------------------------
@@ -427,6 +412,7 @@ def run_forecast(
     checkpoint: dict | None = None,
     n_members: int | None = None,
     include_pressure_levels: bool = False,
+    chunk_layout: Callable[[xr.Dataset], xr.Dataset] | None = None,
     overwrite: bool = False,
     keep_ics: bool = False,
     storage_type: str = "tigris",
@@ -456,6 +442,13 @@ def run_forecast(
         If set, run an AIFS-ENS ensemble forecast with this many members run
         sequentially on a single GPU. If ``None``, run a single deterministic
         AIFS-Single forecast.
+    chunk_layout : callable or None, optional
+        Function ``(ds: xr.Dataset) -> xr.Dataset`` that sets per-variable
+        chunk encoding before writing. Defaults to
+        :data:`aifs_modal.settings.DEFAULT_CHUNK_LAYOUT` (default:
+        :func:`aifs_modal.apply_trajectory_chunks`): one chunk per
+        ``init_time``, 241×240 spatial tiles, full extent on all other
+        dimensions. Pass ``None`` to skip explicit chunking (Zarr defaults).
     """
     _require_outputs_target(outputs_repo, outputs_prefix)
     if ic_source is None:
@@ -530,6 +523,7 @@ def run_forecast(
         outputs_branch=outputs_branch,
         n_members=n_members,
         include_pressure_levels=include_pressure_levels,
+        chunk_layout=chunk_layout,
         overwrite=overwrite,
         keep_ics=keep_ics,
         storage_type=storage_type,
@@ -558,6 +552,7 @@ def run_inference(
     outputs_branch: str = "main",
     n_members: int | None = None,
     include_pressure_levels: bool = False,
+    chunk_layout: Callable[[xr.Dataset], xr.Dataset] | None = None,
     overwrite: bool = False,
     keep_ics: bool = False,
     storage_type: str = "tigris",
@@ -571,6 +566,11 @@ def run_inference(
 
     Initial conditions must be pre-ingested. Use :func:`run_forecast` to ingest
     (if needed) and dispatch inference in one call.
+
+    Parameters
+    ----------
+    chunk_layout : callable or None, optional
+        See :func:`run_forecast` for full description.
     """
     from anemoi.inference.runners.simple import SimpleRunner
 
@@ -643,7 +643,10 @@ def run_inference(
             for m in range(n_members)
         ]
         ds = xr.concat(member_dss, dim="ensemble_member")
-        ds = _apply_dynamical_chunks(ds)
+
+    layout = chunk_layout if chunk_layout is not None else settings.DEFAULT_CHUNK_LAYOUT
+    if layout is not None:
+        ds = layout(ds)
 
     outputs_session = outputs_repo_obj.writable_session(outputs_branch)
     ds.to_zarr(

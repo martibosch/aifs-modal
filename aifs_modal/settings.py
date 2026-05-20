@@ -1,5 +1,7 @@
 """Settings."""
 
+from aifs_modal.utils import apply_trajectory_chunks
+
 # AIFS checkpoints
 AIFS_SINGLE_CHECKPOINT = {"huggingface": "ecmwf/aifs-single-1.1"}
 AIFS_ENS_CHECKPOINT = {"huggingface": "ecmwf/aifs-ens-1.0"}
@@ -7,6 +9,9 @@ AIFS_ENS_CHECKPOINT = {"huggingface": "ecmwf/aifs-ens-1.0"}
 # initial-conditions sources
 IC_SOURCES = ("ifs-arraylake", "ifs-ekd", "era5-cds", "era5-arco")
 DEFAULT_IC_SOURCE = "ifs-arraylake"
+
+# default chunk layout for forecast outputs
+DEFAULT_CHUNK_LAYOUT = apply_trajectory_chunks
 
 # default forecast args
 LEAD_TIME = 96
