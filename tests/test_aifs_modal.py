@@ -237,6 +237,16 @@ class TestIngestRange:
 # ===========================================================================
 # _ingest_ekd.py
 # ===========================================================================
+class _EkdField:
+    """Minimal stand-in for an earthkit-data field."""
+
+    def __init__(self, **meta):
+        self._meta = meta
+
+    def metadata(self, key):
+        return self._meta[key]
+
+
 class TestIngestEkd:
     def test_field_to_n320_rolls_negative_longitudes(self, monkeypatch, rng):
         captured = {}
@@ -322,6 +332,108 @@ class TestIngestEkd:
                 dt.datetime(2024, 1, 1, tzinfo=dt.UTC), "10u", []
             )
 
+    def test_get_open_data_field_naming(self, monkeypatch):
+        monkeypatch.setattr(
+            _ingest_ekd, "_field_to_n320", lambda f: np.ones(3, dtype="f4")
+        )
+        seen = {}
+
+        def fake_from_source(kind, **kwargs):
+            seen["kind"] = kind
+            seen["kwargs"] = kwargs
+            return [_EkdField(param="t", levelist=500)]
+
+        monkeypatch.setattr(_ingest_ekd.ekd, "from_source", fake_from_source)
+        date = dt.datetime(2024, 1, 1, tzinfo=dt.UTC)
+
+        # with levelist: keys are "<param>_<level>"
+        out = _ingest_ekd._get_open_data(date, "t", [500])
+        assert set(out) == {"t_500"}
+        assert seen["kind"] == "ecmwf-open-data"
+        assert seen["kwargs"]["date"].tzinfo is None  # date made naive
+        assert seen["kwargs"]["source"] == "aws"
+
+        # default levelist=None → empty list and plain param key
+        out = _ingest_ekd._get_open_data(date, "t")
+        assert set(out) == {"t"}
+        assert seen["kwargs"]["levelist"] == []
+
+    def test_get_all_open_data_queries_every_param(self, monkeypatch):
+        calls = []
+
+        def fake_get(date, param, levelist=None):
+            calls.append((param, levelist))
+            key = param if levelist is None else f"{param}_{levelist[0]}"
+            return {key: np.ones(3, dtype="f4")}
+
+        monkeypatch.setattr(_ingest_ekd, "_get_open_data", fake_get)
+        out = _ingest_ekd._get_all_open_data(dt.datetime(2024, 1, 1, tzinfo=dt.UTC))
+
+        assert [c[0] for c in calls] == (
+            _ingest_ekd.PARAM_SFC + _ingest_ekd.PARAM_SOIL + _ingest_ekd.PARAM_PL
+        )
+        for param, levelist in calls:
+            if param in _ingest_ekd.PARAM_SOIL:
+                assert levelist == _ingest_ekd.SOIL_LEVELS
+            elif param in _ingest_ekd.PARAM_PL:
+                assert levelist == _ingest_ekd.LEVELS
+            else:
+                assert levelist is None
+        assert len(out) == len(calls)
+
+    def test_get_cds_sfc_keys_by_shortname(self, monkeypatch):
+        monkeypatch.setattr(
+            _ingest_ekd, "_field_to_n320", lambda f: np.ones(3, dtype="f4")
+        )
+        monkeypatch.setattr(
+            _ingest_ekd.ekd,
+            "from_source",
+            lambda *a, **kw: [_EkdField(shortName="2t"), _EkdField(shortName="msl")],
+        )
+        out = _ingest_ekd._get_cds_sfc(dt.datetime(2024, 1, 1, tzinfo=dt.UTC))
+        assert set(out) == {"2t", "msl"}
+
+    def test_get_cds_soil_maps_to_storage_keys(self, monkeypatch):
+        monkeypatch.setattr(
+            _ingest_ekd, "_field_to_n320", lambda f: np.ones(3, dtype="f4")
+        )
+        monkeypatch.setattr(
+            _ingest_ekd.ekd,
+            "from_source",
+            lambda *a, **kw: [
+                _EkdField(shortName="swvl1"),
+                _EkdField(shortName="stl2"),
+            ],
+        )
+        out = _ingest_ekd._get_cds_soil(dt.datetime(2024, 1, 1, tzinfo=dt.UTC))
+        assert set(out) == {"vsw_1", "sot_2"}
+
+    def test_get_cds_pl_converts_z_to_gh(self, monkeypatch):
+        monkeypatch.setattr(
+            _ingest_ekd,
+            "_field_to_n320",
+            lambda f: np.full(3, 2 * _ic._G, dtype="f4"),
+        )
+        monkeypatch.setattr(
+            _ingest_ekd.ekd,
+            "from_source",
+            lambda *a, **kw: [
+                _EkdField(shortName="z", level=500),
+                _EkdField(shortName="t", level=850),
+            ],
+        )
+        out = _ingest_ekd._get_cds_pl(dt.datetime(2024, 1, 1, tzinfo=dt.UTC))
+        assert set(out) == {"gh_500", "t_850"}
+        np.testing.assert_allclose(out["gh_500"], 2.0)
+        np.testing.assert_allclose(out["t_850"], 2 * _ic._G)
+
+    def test_get_all_cds_merges(self, monkeypatch):
+        monkeypatch.setattr(_ingest_ekd, "_get_cds_sfc", lambda d: {"a": 1})
+        monkeypatch.setattr(_ingest_ekd, "_get_cds_soil", lambda d: {"b": 2})
+        monkeypatch.setattr(_ingest_ekd, "_get_cds_pl", lambda d: {"c": 3})
+        out = _ingest_ekd._get_all_cds(dt.datetime(2024, 1, 1, tzinfo=dt.UTC))
+        assert out == {"a": 1, "b": 2, "c": 3}
+
 
 # ===========================================================================
 # _ingest_era5_arco.py
@@ -361,6 +473,120 @@ class TestIngestArco:
         )
         with pytest.raises(ValueError, match="level required"):
             _ingest_era5_arco._get_array(g, "four_d", time_index=5)
+
+    def test_get_array_3d_with_level_indexes_level(self, rng):
+        # 3D array shaped (level, lat, lon) — level given, no time dimension
+        level_arr = np.array([50, 500, 1000], dtype="i4")
+        arr3 = rng.random((3, 7, 9), dtype="f4")
+
+        class _Group:
+            def __getitem__(self, k):
+                return {"level": level_arr, "x": arr3}[k]
+
+        np.testing.assert_array_equal(
+            _ingest_era5_arco._get_array(_Group(), "x", time_index=2, level=1000),
+            arr3[2, 2],
+        )
+
+    def test_get_array_unexpected_shape_raises(self, rng):
+        class _Group:
+            def __getitem__(self, k):
+                return np.zeros(5, dtype="f4")
+
+        with pytest.raises(ValueError, match="Unexpected array shape"):
+            _ingest_era5_arco._get_array(_Group(), "one_d", time_index=0)
+
+    def test_get_all_data_fetches_full_keyset(self, monkeypatch):
+        # the ARCO store's level coordinate is ascending (searchsorted relies on it)
+        levels = np.sort(np.array(_ingest_era5_arco.LEVELS, dtype="i4"))
+        n_time, n_lat, n_lon = 2, 3, 4
+        consts = {}
+        arrays = {"level": levels}
+        sfc_names = {**_ingest_era5_arco._SFC_ARCO, **_ingest_era5_arco._SOIL_ARCO}
+        for i, arco_name in enumerate(sfc_names.values()):
+            consts[arco_name] = float(i + 1)
+            arrays[arco_name] = np.full(
+                (n_time, n_lat, n_lon), consts[arco_name], dtype="f4"
+            )
+        for j, arco_name in enumerate(_ingest_era5_arco._PL_ARCO.values()):
+            consts[arco_name] = float(100 + j)
+            arrays[arco_name] = np.full(
+                (n_time, len(levels), n_lat, n_lon), consts[arco_name], dtype="f4"
+            )
+
+        class _Group:
+            def __getitem__(self, k):
+                return arrays[k]
+
+        monkeypatch.setattr(_ingest_era5_arco, "_open_arco", lambda: _Group())
+        monkeypatch.setattr(_ingest_era5_arco, "_regrid_n320", lambda a: a)
+        _ingest_era5_arco._get_time_index.cache_clear()
+
+        # 1900-01-01 01:00 → time index 1 (< n_time)
+        data = _ingest_era5_arco.get_all_data(dt.datetime(1900, 1, 1, 1, tzinfo=dt.UTC))
+
+        expected = (
+            set(_ingest_era5_arco._SFC_ARCO)
+            | set(_ingest_era5_arco._SOIL_ARCO)
+            | {
+                f"{p}_{lvl}"
+                for p in _ingest_era5_arco._PL_ARCO
+                for lvl in _ingest_era5_arco.LEVELS
+            }
+        )
+        assert set(data) == expected
+        np.testing.assert_allclose(data["2t"], consts["2m_temperature"])
+        np.testing.assert_allclose(
+            data["vsw_1"], consts["volumetric_soil_water_layer_1"]
+        )
+        np.testing.assert_allclose(data["t_500"], consts["temperature"])
+        # geopotential is converted to geopotential height
+        np.testing.assert_allclose(
+            data["gh_500"], consts["geopotential"] / _ingest_era5_arco._G
+        )
+
+    def test_ingest_dispatches_to_ingest_range(self, monkeypatch, ic_dir):
+        seen = {}
+
+        def fake_ingest_range(s, e, d, fetch_fn, *, source):
+            seen["fetch_fn"] = fetch_fn
+            seen["source"] = source
+
+        monkeypatch.setattr(_ic, "_ingest_range", fake_ingest_range)
+        _ingest_era5_arco.ingest("2024-01-01", "2024-01-01", ic_dir)
+        assert seen["fetch_fn"] is _ingest_era5_arco.get_all_data
+        assert seen["source"] == "era5-arco"
+
+    def test_open_arco_opens_anonymous_readonly(self, monkeypatch):
+        fs_kwargs = {}
+        monkeypatch.setattr(
+            _ingest_era5_arco.gcsfs,
+            "GCSFileSystem",
+            lambda **kw: fs_kwargs.update(kw) or "FS",
+        )
+        monkeypatch.setattr(
+            _ingest_era5_arco.zarr.storage,
+            "FsspecStore",
+            lambda fs, path: ("STORE", fs, path),
+        )
+        monkeypatch.setattr(
+            _ingest_era5_arco.zarr,
+            "open",
+            lambda store, mode: ("GROUP", store, mode),
+        )
+        _ingest_era5_arco._open_arco.cache_clear()
+        try:
+            group = _ingest_era5_arco._open_arco()
+        finally:
+            # don't leave the fake group in the lru_cache for other tests
+            _ingest_era5_arco._open_arco.cache_clear()
+        assert fs_kwargs["token"] == "anon"
+        assert fs_kwargs["access"] == "read_only"
+        assert group == (
+            "GROUP",
+            ("STORE", "FS", _ingest_era5_arco._ARCO_PATH),
+            "r",
+        )
 
 
 # ===========================================================================
@@ -405,6 +631,13 @@ class TestIngestArraylake:
         m = _ingest_ifs_arraylake._build_rename_map(ds)
         assert m.get("tcwv") == "tcwv"
         assert "tcw" not in m
+
+    def test_build_rename_map_includes_soil(self, rng):
+        ds = _bb_dataset(rng)
+        ds = ds.assign(stl1=ds["t2m"].copy(), swvl2=ds["t2m"].copy())
+        m = _ingest_ifs_arraylake._build_rename_map(ds)
+        assert m["stl1"] == "sot_1"
+        assert m["swvl2"] == "vsw_2"
 
     def test_to_eastward_normalizes_negative_longitudes(self):
         ds = xr.Dataset(
@@ -455,6 +688,24 @@ class TestIngestArraylake:
         assert set(out) == {"lsm", "z", "slor", "sdor"}
         for v in out.values():
             assert v.shape == (3,) and v.dtype == np.dtype("f4")
+
+    def test_read_static_fields_squeezes_leading_dims(self, monkeypatch, rng):
+        ds = xr.Dataset(
+            {
+                src: (("time", "y", "x"), rng.random((1, 4, 8), dtype="f4"))
+                for src in _ingest_ifs_arraylake._STATIC_VARS
+            }
+        )
+        seen_ndims = []
+
+        def fake_regrid(a):
+            seen_ndims.append(a.ndim)
+            return a.ravel()[:3].astype("f4")
+
+        monkeypatch.setattr(_ingest_ifs_arraylake, "_regrid_n320", fake_regrid)
+        out = _ingest_ifs_arraylake._read_static_fields(ds)
+        assert set(out) == {"lsm", "z", "slor", "sdor"}
+        assert seen_ndims == [2] * 4
 
     def test_ingest_writes_missing_dates(self, monkeypatch, rng, ic_dir):
         ds = _bb_dataset(rng)
@@ -802,6 +1053,29 @@ class TestRunForecastImpl:
         with pytest.raises(ValueError, match="ic_source_repo is required"):
             _call_forecast(recorders)
 
+    def test_missing_outputs_branch_does_not_skip(
+        self, recorders, init_date, local_outputs_repo, rng
+    ):
+        # forecast exists on main, but the requested branch doesn't exist →
+        # the skip check must not trigger and inference must be dispatched
+        sess = local_outputs_repo.writable_session("main")
+        xr.Dataset({"x": (("a",), rng.random(3))}).to_zarr(
+            sess.store,
+            group=utils.datetime_to_str(init_date),
+            zarr_format=3,
+            consolidated=False,
+            mode="w",
+        )
+        sess.commit("seed")
+        _call_forecast(
+            recorders,
+            date=init_date,
+            open_outputs_repo_fn=lambda *a, **kw: local_outputs_repo,
+            outputs_branch="not-there",
+            ic_source="ifs-ekd",
+        )
+        assert len(recorders["run_inference_fn"].calls) == 1
+
 
 # ===========================================================================
 # _run_inference_impl — local-FS icechunk + fake runner
@@ -1000,6 +1274,77 @@ class TestRunInferenceImpl:
             chunk_layout=None,
         )
         reload_mock.assert_called_once()
+
+
+# ===========================================================================
+# Modal-facing wrappers (modal mocked in conftest)
+# ===========================================================================
+class TestModalWrappers:
+    def test_run_forecast_wires_modal_primitives(self, monkeypatch, init_date):
+        captured = {}
+
+        def fake_impl(date, bucket, **kwargs):
+            captured["date"] = date
+            captured.update(kwargs)
+
+        monkeypatch.setattr(_app, "_run_forecast_impl", fake_impl)
+        _app.run_forecast(init_date, "bucket", outputs_prefix="p")
+        assert captured["date"] == init_date
+        assert captured["ingest_era5_arco_fn"] is _app.ingest_era5_arco.remote
+        assert captured["ingest_ifs_arraylake_fn"] is _app.ingest_ifs_arraylake.remote
+        assert captured["run_inference_fn"] is _app.run_inference.remote
+        assert captured["ic_dir"] == settings.IC_DIR
+        assert captured["on_ic_reload"] is _app.ic_volume.reload
+
+    def test_run_forecast_ekd_fn_ingests_and_commits(self, monkeypatch, init_date):
+        captured = {}
+        monkeypatch.setattr(
+            _app, "_run_forecast_impl", lambda *a, **kw: captured.update(kw)
+        )
+        ekd_calls = []
+        monkeypatch.setattr(_app.ingest_ekd, "ingest", lambda *a: ekd_calls.append(a))
+        _app.run_forecast(init_date, "bucket", outputs_prefix="p")
+        _app.ic_volume.commit.reset_mock()
+        captured["ingest_ekd_fn"]("s", "e", "/ic", "ifs-ekd")
+        assert ekd_calls == [("s", "e", "/ic", "ifs-ekd")]
+        _app.ic_volume.commit.assert_called_once()
+
+    def test_ingest_era5_arco_commits_volume(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(_ingest_era5_arco, "ingest", lambda *a: calls.append(a))
+        _app.ic_volume.commit.reset_mock()
+        _app.ingest_era5_arco("2024-01-01T00:00:00", "2024-01-01T06:00:00")
+        assert calls == [
+            ("2024-01-01T00:00:00", "2024-01-01T06:00:00", settings.IC_DIR)
+        ]
+        _app.ic_volume.commit.assert_called_once()
+
+    @pytest.fixture
+    def patched_inference(self, monkeypatch):
+        repo = object()
+        monkeypatch.setattr(_app, "_open_outputs_repo", lambda *a, **kw: repo)
+        impl = mock.Mock(return_value=True)
+        monkeypatch.setattr(_app, "_run_inference_impl", impl)
+        _app.ic_volume.commit.reset_mock()
+        return repo, impl
+
+    def test_run_inference_commits_ics_after_write(self, patched_inference, init_date):
+        repo, impl = patched_inference
+        _app.run_inference(init_date, "bucket", {}, outputs_prefix="p")
+        assert impl.call_args.kwargs["outputs_repo_obj"] is repo
+        _app.ic_volume.commit.assert_called_once()
+
+    def test_run_inference_no_commit_on_skip(self, patched_inference, init_date):
+        _repo, impl = patched_inference
+        impl.return_value = False
+        _app.run_inference(init_date, "bucket", {}, outputs_prefix="p")
+        _app.ic_volume.commit.assert_not_called()
+
+    def test_run_inference_no_commit_with_keep_ics(self, patched_inference, init_date):
+        _repo, impl = patched_inference
+        _app.run_inference(init_date, "bucket", {}, outputs_prefix="p", keep_ics=True)
+        assert impl.call_args.kwargs["keep_ics"] is True
+        _app.ic_volume.commit.assert_not_called()
 
 
 # ===========================================================================
