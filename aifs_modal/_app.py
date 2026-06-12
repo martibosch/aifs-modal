@@ -250,7 +250,7 @@ def _require_outputs_target(
 def _ic_dates_present(date: datetime.datetime, ic_dir: str) -> bool:
     """Return True if ICs for *date* and *date−6h* are both on the volume."""
     for d in [date - datetime.timedelta(hours=6), date]:
-        if not os.path.exists(os.path.join(ic_dir, utils.datetime_to_str(d))):
+        if not ic.ic_date_complete(os.path.join(ic_dir, utils.datetime_to_str(d))):
             return False
     return True
 

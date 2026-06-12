@@ -76,9 +76,12 @@ def get_and_store_date(
 ) -> None:
     """Fetch one date with *fetch_fn* and write its zarr group into *ic_dir*."""
     date_path = os.path.join(ic_dir, utils.datetime_to_str(date))
-    group = zarr.open_group(date_path, mode="w", zarr_format=3)
+    # Fetch/regrid first: only create the group once we have data to write, so a
+    # crash here cannot leave an empty dir that the os.path.exists() skip-check
+    # (_ingest_range / _ic_dates_present) would later treat as already ingested.
     data_dict = fetch_fn(date)
     names, stacked = _stack_fields(data_dict)
+    group = zarr.open_group(date_path, mode="w", zarr_format=3)
     _store_data(group, names, stacked)
 
 
@@ -130,6 +133,18 @@ def delete_ic_dates(date: datetime.datetime, ic_dir: str) -> None:
             print(f"deleted IC directory {path}")
 
 
+def ic_date_complete(date_path: str) -> bool:
+    """Return True only if *date_path* holds a fully written IC group.
+
+    Guards against empty/partial group dirs (e.g. from a crashed ingest): a date
+    counts as ingested only once both the ``variable`` and ``fields`` arrays
+    exist, so incomplete dirs are re-ingested rather than skipped.
+    """
+    return os.path.exists(os.path.join(date_path, "variable")) and os.path.exists(
+        os.path.join(date_path, "fields")
+    )
+
+
 def _ingest_range(
     start_date: str,
     end_date: str,
@@ -151,7 +166,7 @@ def _ingest_range(
     ingested_dates = []
     for i, date in enumerate(dates, start=1):
         date_path = os.path.join(ic_dir, utils.datetime_to_str(date))
-        if os.path.exists(date_path):
+        if ic_date_complete(date_path):
             print(
                 f"[{i}/{len(dates)}] {source} already ingested for "
                 f"{date.isoformat()}; skipping"

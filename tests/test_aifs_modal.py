@@ -49,13 +49,18 @@ class TestRequireOutputsTarget:
 
 
 class TestIcDatesPresent:
-    def test_present_when_both_exist(self, tmp_path, init_date):
+    def test_present_when_both_complete(self, ic_dir, init_date, write_ic_dates):
+        write_ic_dates([init_date - dt.timedelta(hours=6), init_date])
+        assert _app._ic_dates_present(init_date, ic_dir)
+
+    def test_missing_when_only_one_exists(self, ic_dir, init_date, write_ic_dates):
+        write_ic_dates([init_date])
+        assert not _app._ic_dates_present(init_date, ic_dir)
+
+    def test_empty_dirs_not_present(self, tmp_path, init_date):
+        # bare date dirs (e.g. left by a crashed ingest) must not count
         for d in [init_date - dt.timedelta(hours=6), init_date]:
             (tmp_path / utils.datetime_to_str(d)).mkdir(parents=True)
-        assert _app._ic_dates_present(init_date, str(tmp_path))
-
-    def test_missing_when_only_one_exists(self, tmp_path, init_date):
-        (tmp_path / utils.datetime_to_str(init_date)).mkdir(parents=True)
         assert not _app._ic_dates_present(init_date, str(tmp_path))
 
 
@@ -232,6 +237,54 @@ class TestIngestRange:
             source="test",
         )
         assert "already present" in capsys.readouterr().out
+
+    def test_reingests_incomplete_date_dir(self, ic_dir, init_date, rng):
+        # empty dir from a crashed ingest is rewritten, not skipped
+        date_path = os.path.join(ic_dir, utils.datetime_to_str(init_date))
+        os.makedirs(date_path)
+
+        called = []
+
+        def fetch_fn(d):
+            called.append(d)
+            return {"x": rng.random(5, dtype="f4")}
+
+        _ic._ingest_range(
+            init_date.isoformat(),
+            init_date.isoformat(),
+            ic_dir,
+            fetch_fn,
+            source="test",
+        )
+        assert called == [init_date]
+        assert _ic.ic_date_complete(date_path)
+
+
+class TestIcDateComplete:
+    def test_true_after_store(self, ic_dir, init_date, rng):
+        _ic.get_and_store_date(
+            init_date, ic_dir, lambda d: {"x": rng.random(5, dtype="f4")}
+        )
+        assert _ic.ic_date_complete(
+            os.path.join(ic_dir, utils.datetime_to_str(init_date))
+        )
+
+    def test_false_for_empty_dir(self, tmp_path):
+        assert not _ic.ic_date_complete(str(tmp_path))
+
+    def test_false_for_missing_dir(self, tmp_path):
+        assert not _ic.ic_date_complete(str(tmp_path / "nope"))
+
+    def test_failed_fetch_leaves_no_dir(self, ic_dir, init_date):
+        # group must only be created once fetch/regrid has produced data
+        def boom(d):
+            raise RuntimeError("regrid crashed")
+
+        with pytest.raises(RuntimeError, match="regrid crashed"):
+            _ic.get_and_store_date(init_date, ic_dir, boom)
+        assert not os.path.exists(
+            os.path.join(ic_dir, utils.datetime_to_str(init_date))
+        )
 
 
 # ===========================================================================
@@ -974,7 +1027,21 @@ class TestRunForecastImpl:
         assert len(recorders["ingest_ekd_fn"].calls) == 1
         assert recorders["ingest_ekd_fn"].calls[0][0][3] == "ifs-ekd"
 
-    def test_skips_ingest_when_ics_present(self, recorders, tmp_path, init_date):
+    def test_skips_ingest_when_ics_present(
+        self, recorders, ic_dir, init_date, write_ic_dates
+    ):
+        write_ic_dates([init_date - dt.timedelta(hours=6), init_date])
+        _call_forecast(
+            recorders,
+            date=init_date,
+            ic_dir=ic_dir,
+            ic_source="ifs-ekd",
+        )
+        assert recorders["ingest_ekd_fn"].calls == []
+        assert len(recorders["run_inference_fn"].calls) == 1
+
+    def test_reingests_when_ic_dirs_incomplete(self, recorders, tmp_path, init_date):
+        # empty date dirs from a crashed ingest must trigger re-ingestion
         for d in [init_date - dt.timedelta(hours=6), init_date]:
             (tmp_path / utils.datetime_to_str(d)).mkdir(parents=True)
         _call_forecast(
@@ -983,8 +1050,7 @@ class TestRunForecastImpl:
             ic_dir=str(tmp_path),
             ic_source="ifs-ekd",
         )
-        assert recorders["ingest_ekd_fn"].calls == []
-        assert len(recorders["run_inference_fn"].calls) == 1
+        assert len(recorders["ingest_ekd_fn"].calls) == 1
 
     def test_skips_when_existing_forecast(
         self, recorders, init_date, local_outputs_repo, rng
