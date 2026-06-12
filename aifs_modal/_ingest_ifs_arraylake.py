@@ -58,8 +58,29 @@ _PL_PREFIX_MAP = {
 }
 
 
+def _to_eastward_0_360(ds: xr.Dataset) -> xr.Dataset:
+    """Reorder a dataset to ascending longitude on ``[0, 360)``.
+
+    ``_regrid_n320`` hands raw ``.values`` to earthkit-regrid declaring the source
+    as the ECMWF global ``(0.25, 0.25)`` grid, whose first column is longitude 0°
+    increasing eastward (N320 point 0 sits at lon 0°). The Brightband source is
+    stored on ``[-180, 180)`` (column 0 == −180°), so passing it positionally would
+    rotate every field by 180° (720 columns), shifting the whole forecast in
+    longitude. Normalise here, label-based, so the array columns match earthkit's
+    convention. No-op (idempotent) for data already on ``[0, 360)``.
+    """
+    lon_name = next((c for c in ("longitude", "lon") if c in ds.coords), None)
+    if lon_name is None:
+        return ds
+    lon = ds[lon_name]
+    if float(lon.min()) < 0:
+        ds = ds.assign_coords({lon_name: lon % 360}).sortby(lon_name)
+    return ds
+
+
 def _read_static_fields(ds_static: xr.Dataset) -> dict[str, np.ndarray]:
     """Read time-invariant surface fields from the static-vars branch dataset."""
+    ds_static = _to_eastward_0_360(ds_static)
     data = {}
     for src in _STATIC_VARS:
         arr = ds_static[src].values.astype("f4")
@@ -121,6 +142,7 @@ def ingest(
     Reads all missing dates in a single batched ``.sel()`` to avoid
     per-date dask graph rebuilding, then writes each date individually.
     """
+    source_ds = _to_eastward_0_360(source_ds)
     start = ic._parse_utc_date(start_date)
     end = ic._parse_utc_date(end_date)
     if end < start:

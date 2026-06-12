@@ -406,6 +406,26 @@ class TestIngestArraylake:
         assert m.get("tcwv") == "tcwv"
         assert "tcw" not in m
 
+    def test_to_eastward_normalizes_negative_longitudes(self):
+        ds = xr.Dataset(
+            {"v": (("longitude",), np.array([0.0, 1.0, 2.0, 3.0], dtype="f4"))},
+            coords={"longitude": np.array([-180.0, -90.0, 0.0, 90.0])},
+        )
+        out = _ingest_ifs_arraylake._to_eastward_0_360(ds)
+        np.testing.assert_array_equal(out["longitude"].values, [0, 90, 180, 270])
+        np.testing.assert_array_equal(out["v"].values, [2, 3, 0, 1])
+
+    def test_to_eastward_noop_when_already_0_360(self):
+        ds = xr.Dataset(
+            {"v": (("longitude",), np.arange(4, dtype="f4"))},
+            coords={"longitude": np.array([0.0, 90.0, 180.0, 270.0])},
+        )
+        assert _ingest_ifs_arraylake._to_eastward_0_360(ds) is ds
+
+    def test_to_eastward_noop_without_longitude_coord(self):
+        ds = xr.Dataset({"v": (("x",), np.arange(4, dtype="f4"))})
+        assert _ingest_ifs_arraylake._to_eastward_0_360(ds) is ds
+
     def test_pl_src_prefixes(self, rng):
         ds = _bb_dataset(rng)
         assert set(_ingest_ifs_arraylake._pl_src_prefixes(ds)) == {
