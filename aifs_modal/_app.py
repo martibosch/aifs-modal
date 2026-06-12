@@ -450,6 +450,70 @@ def run_forecast(
         ``init_time``, 241×240 spatial tiles, full extent on all other
         dimensions. Pass ``None`` to skip explicit chunking (Zarr defaults).
     """
+
+    def _ingest_ekd_with_commit(start, end, ic_dir, source):
+        ingest_ekd.ingest(start, end, ic_dir, source)
+        ic_volume.commit()
+
+    _run_forecast_impl(
+        date,
+        storage_bucket,
+        ic_dir=settings.IC_DIR,
+        ingest_era5_arco_fn=ingest_era5_arco.remote,
+        ingest_ifs_arraylake_fn=ingest_ifs_arraylake.remote,
+        ingest_ekd_fn=_ingest_ekd_with_commit,
+        run_inference_fn=run_inference.remote,
+        on_ic_reload=ic_volume.reload,
+        ic_source=ic_source,
+        ic_source_repo=ic_source_repo,
+        ic_source_branch=ic_source_branch,
+        ic_source_static_branch=ic_source_static_branch,
+        lead_time=lead_time,
+        outputs_repo=outputs_repo,
+        outputs_prefix=outputs_prefix,
+        outputs_branch=outputs_branch,
+        checkpoint=checkpoint,
+        n_members=n_members,
+        include_pressure_levels=include_pressure_levels,
+        chunk_layout=chunk_layout,
+        overwrite=overwrite,
+        keep_ics=keep_ics,
+        storage_type=storage_type,
+    )
+
+
+def _run_forecast_impl(
+    date: datetime.datetime,
+    storage_bucket: str,
+    *,
+    ic_dir: str,
+    ingest_era5_arco_fn: Callable[[str, str], None],
+    ingest_ifs_arraylake_fn: Callable[..., None],
+    ingest_ekd_fn: Callable[[str, str, str, str], None],
+    run_inference_fn: Callable[..., None],
+    on_ic_reload: Callable[[], None] = lambda: None,
+    open_outputs_repo_fn: Callable[..., object] = _open_outputs_repo,
+    ic_source: str | None = None,
+    ic_source_repo: str | None = None,
+    ic_source_branch: str = "main",
+    ic_source_static_branch: str = "add-static-vars",
+    lead_time: int | None = None,
+    outputs_repo: str | None = None,
+    outputs_prefix: str | None = None,
+    outputs_branch: str = "main",
+    checkpoint: dict | None = None,
+    n_members: int | None = None,
+    include_pressure_levels: bool = False,
+    chunk_layout: Callable[[xr.Dataset], xr.Dataset] | None = None,
+    overwrite: bool = False,
+    keep_ics: bool = False,
+    storage_type: str = "tigris",
+) -> None:
+    """Core orchestration logic for :func:`run_forecast`, free of Modal calls.
+
+    Tests inject recorder callables for ``ingest_*_fn`` and ``run_inference_fn``
+    and a local-FS icechunk repo via ``open_outputs_repo_fn``.
+    """
     _require_outputs_target(outputs_repo, outputs_prefix)
     if ic_source is None:
         ic_source = settings.DEFAULT_IC_SOURCE
@@ -457,7 +521,7 @@ def run_forecast(
     if not overwrite:
         base_group = utils.datetime_to_str(date)
         try:
-            outputs_repo_obj = _open_outputs_repo(
+            outputs_repo_obj = open_outputs_repo_fn(
                 storage_bucket,
                 outputs_repo=outputs_repo,
                 outputs_prefix=outputs_prefix,
@@ -485,18 +549,18 @@ def run_forecast(
         except Exception:
             pass
 
-    ic_volume.reload()
-    if not _ic_dates_present(date, settings.IC_DIR):
+    on_ic_reload()
+    if not _ic_dates_present(date, ic_dir):
         start = (date - datetime.timedelta(hours=6)).isoformat()
         end = date.isoformat()
         if ic_source == "era5-arco":
-            ingest_era5_arco.remote(start, end)
+            ingest_era5_arco_fn(start, end)
         elif ic_source == "ifs-arraylake":
             if ic_source_repo is None:
                 raise ValueError(
                     "ic_source_repo is required when ic_source='ifs-arraylake'"
                 )
-            ingest_ifs_arraylake.remote(
+            ingest_ifs_arraylake_fn(
                 start,
                 end,
                 ic_source_repo,
@@ -504,8 +568,7 @@ def run_forecast(
                 ic_source_static_branch=ic_source_static_branch,
             )
         else:  # ifs-ekd or era5-cds
-            ingest_ekd.ingest(start, end, settings.IC_DIR, ic_source)
-            ic_volume.commit()
+            ingest_ekd_fn(start, end, ic_dir, ic_source)
 
     if checkpoint is None:
         checkpoint = (
@@ -513,7 +576,7 @@ def run_forecast(
             if n_members is None
             else settings.AIFS_ENS_CHECKPOINT
         )
-    run_inference.remote(
+    run_inference_fn(
         date,
         storage_bucket,
         checkpoint,
@@ -575,13 +638,62 @@ def run_inference(
     from anemoi.inference.runners.simple import SimpleRunner
 
     _require_outputs_target(outputs_repo, outputs_prefix)
-
     outputs_repo_obj = _open_outputs_repo(
         storage_bucket,
         outputs_repo=outputs_repo,
         outputs_prefix=outputs_prefix,
         storage_type=storage_type,
     )
+
+    ran = _run_inference_impl(
+        date,
+        outputs_repo_obj=outputs_repo_obj,
+        runner_factory=lambda: SimpleRunner(checkpoint, device="cuda"),
+        regridder_factory=lambda: get_gpu_regridder(
+            {"grid": "N320"}, {"grid": (0.25, 0.25)}
+        ),
+        ic_dir=settings.IC_DIR,
+        on_ic_reload=ic_volume.reload,
+        outputs_branch=outputs_branch,
+        lead_time=lead_time,
+        n_members=n_members,
+        include_pressure_levels=include_pressure_levels,
+        chunk_layout=chunk_layout,
+        overwrite=overwrite,
+        keep_ics=keep_ics,
+    )
+    if ran and not keep_ics:
+        ic_volume.commit()
+
+
+def _run_inference_impl(
+    date: datetime.datetime,
+    *,
+    outputs_repo_obj,
+    runner_factory: Callable[[], object],
+    regridder_factory: Callable[[], object],
+    ic_dir: str,
+    on_ic_reload: Callable[[], None] = lambda: None,
+    outputs_branch: str = "main",
+    lead_time: int | None = None,
+    n_members: int | None = None,
+    include_pressure_levels: bool = False,
+    chunk_layout: Callable[[xr.Dataset], xr.Dataset] | None = None,
+    overwrite: bool = False,
+    keep_ics: bool = False,
+) -> bool:
+    """Core inference logic for :func:`run_inference`, free of Modal calls.
+
+    Tests inject a ``runner_factory`` returning a fake AIFS runner and a
+    ``regridder_factory`` returning a CPU regridder. ``outputs_repo_obj`` may
+    be a local-FS icechunk repo.
+
+    Returns
+    -------
+    bool
+        ``True`` if a forecast was written, ``False`` if the existing-forecast
+        skip path was taken.
+    """
     if outputs_branch not in outputs_repo_obj.list_branches():
         base = outputs_repo_obj.readonly_session("main").snapshot_id
         outputs_repo_obj.create_branch(outputs_branch, base)
@@ -606,17 +718,17 @@ def run_inference(
                     f"Forecast already exists for {date.isoformat()} "
                     f"(group: {base_group}); skipping"
                 )
-                return
+                return False
         except Exception:
             pass
 
-    ic_volume.reload()
+    on_ic_reload()
     print("loading initial conditions for", date)
-    fields = ic.fetch_initial_conditions(date, settings.IC_DIR)
+    fields = ic.fetch_initial_conditions(date, ic_dir)
     print("loading model checkpoint")
-    runner = SimpleRunner(checkpoint, device="cuda")
+    runner = runner_factory()
     print("initializing regridder")
-    regridder = get_gpu_regridder({"grid": "N320"}, {"grid": (0.25, 0.25)})
+    regridder = regridder_factory()
     print("running inference")
 
     if n_members is None:
@@ -666,5 +778,5 @@ def run_inference(
     print(commit_msg)
 
     if not keep_ics:
-        ic.delete_ic_dates(date, settings.IC_DIR)
-        ic_volume.commit()
+        ic.delete_ic_dates(date, ic_dir)
+    return True
